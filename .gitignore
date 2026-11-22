@@ -6,3 +6,5 @@ kernel/ffs/Module.symvers
 kernel/ffs/modules.order
 kernel/ffs/ffs_dev
 kernel/ffs/host_bulk
+kernel/ffs/host_loop
+kernel/ffs/host_verify

@@ -10,7 +10,7 @@ sys.argv = [sys.argv[0], os.environ.get("RATE", "30.72")]
 sys.path.insert(0, '/home/xilinx/p501UHD/notebooks')
 from pynq import Overlay, allocate
 import ad9361_mimo_test as mt
-ol = Overlay("base/system_top.bit")
+ol = Overlay(os.environ.get("P501_BIT", "base/system_top.bit"))
 ad, rx_ok, tx_ok, res = mt.bring_up(ol, 700_000_000)
 print(f"fs={mt.FS/1e6} locks={rx_ok},{tx_ok}", flush=True)
 ad.reg_write(0x3F6, 0)
@@ -20,7 +20,7 @@ dma_phys = ol.ip_dict["axi_ad9361_adc_dma"]["phys_addr"]
 print(f"ring phys {ring.physical_address:#x} dma {dma_phys:#x}", flush=True)
 try:
     subprocess.run(["/home/xilinx/p501UHD/kernel/ffs/p501_stream", "/dev/ffs", hex(ring.physical_address), str(slot_mb * 1024 * 1024),
-                    str(nslots), hex(dma_phys), secs])
+                    str(nslots), hex(dma_phys), secs, hex(ol.ip_dict["axi_ad9361"]["phys_addr"])])
 finally:
     ad.reg_write(0x3F4, 0)
     ad.close()

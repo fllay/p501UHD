@@ -91,7 +91,7 @@ static const struct {
 #define REG_X_LENGTH 0x418
 #define REG_Y_LENGTH 0x41C
 #define REG_TRANSFER_DONE 0x428
-static volatile uint32_t *dma;
+static volatile uint32_t *dma; static volatile uint32_t *adc9361; static uint64_t hwovf_slots = 0;
 static char *ring;
 static uint64_t ring_phys; static size_t slot_bytes; int nslots; static uint64_t dma_phys; static double run_secs;
 
@@ -134,6 +134,7 @@ static void *stream_thread(void *a)
 		if (nsub > nsend && done[nsend % nslots]) {
 			int s = nsend % nslots; char *base = ring + (size_t)s * slot_bytes;
 			civac(base, slot_bytes);
+			if (adc9361) { uint32_t st = adc9361[0x88 / 4]; if (st & 4) { adc9361[0x88 / 4] = 4; hwovf_slots++; ovr_flag |= 2; if (hwovf_slots <= 40) { printf("HWOVF slot=%llu first_seq=%llu t=%.3f\n", (unsigned long long)nsend, (unsigned long long)seq, now() - t0); fflush(stdout); } } }
 			{ uint64_t *sp = (uint64_t *)(base + slot_bytes - 64); if (sp[0] == SENT && sp[7] == SENT) { premature++; if (premature <= 20) { printf("PREMATURE slot=%d nsend=%llu nsub=%llu pending=%d mask=%x t=%.3f\n", s, (unsigned long long)nsend, (unsigned long long)nsub, pending, m, now() - t0); fflush(stdout); } } }
 			for (size_t off = 0; off < slot_bytes; off += PAYLOAD) {
 				struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = seq++, .payload_len = PAYLOAD, .flags = ovr_flag, .chunk = nsend, .overruns = overruns, .slot_off = (uint32_t)off };
@@ -148,7 +149,7 @@ static void *stream_thread(void *a)
 	}
 out:
 	dma[REG_CTRL / 4] = 0;
-	printf("premature total %llu\n", (unsigned long long)premature); printf("done: %llu chunks, %llu MB, overruns %u\n", (unsigned long long)nsend, (unsigned long long)(bytes / 1000000), overruns); fflush(stdout);
+	printf("hwovf_slots %llu\n", (unsigned long long)hwovf_slots); printf("premature total %llu\n", (unsigned long long)premature); printf("done: %llu chunks, %llu MB, overruns %u\n", (unsigned long long)nsend, (unsigned long long)(bytes / 1000000), overruns); fflush(stdout);
 	exit(0);
 	return NULL;
 }
@@ -162,6 +163,7 @@ int main(int argc, char **argv)
 	dma = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, dma_phys); if (dma == MAP_FAILED) { perror("mmap dma"); return 1; }
 	int cfd = open("/dev/mem", O_RDWR);                         // cached mapping of the CMA ring
 	ring = mmap(0, (size_t)nslots * slot_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, ring_phys); if (ring == MAP_FAILED) { perror("mmap ring"); return 1; }
+	if (argc > 7) { off_t pa = strtoull(argv[7], 0, 0); adc9361 = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, pa); if (adc9361 == MAP_FAILED) { perror("mmap adc"); adc9361 = NULL; } else adc9361[0x88 / 4] = 4; }
 	char p[256]; snprintf(p, sizeof p, "%s/ep0", dir);
 	int ep0 = open(p, O_RDWR); if (ep0 < 0) { perror("open ep0"); return 1; }
 	if (write(ep0, &descriptors, sizeof descriptors) < 0) { perror("write descriptors"); return 1; }

@@ -25,6 +25,11 @@ import os
 import time
 
 import spidev
+import os
+try:
+    from ad9361_synth_lut import synth_lut
+except ImportError:  # imported as part of a package
+    from .ad9361_synth_lut import synth_lut
 
 REG_TX_ENABLE_FILTER_CTRL = 0x002
 REG_RX_ENABLE_FILTER_CTRL = 0x003
@@ -420,9 +425,43 @@ def div_round_closest(a, b):
     return (a + b // 2) // b
 
 
+SYNTH_MAX_FREF_HZ = 80_008_000   # vendor MAX_SYNTH_FREF (80 MHz + 100 ppm)
+MIN_SYNTH_FREF_HZ = 9_999_000    # vendor MIN_SYNTH_FREF
+
+
+def synth_ref_div_sel(refin_hz, max_hz=SYNTH_MAX_FREF_HZ):
+    """Port of ad9361_ref_div_sel() + ad9361_to_refclk_scaler().
+
+    Returns (RF PLL reference in Hz, REF_DIVIDE field). The vendor driver runs
+    both RF PLLs from the reference scaled to at most trx_synth_max_fref
+    (default 80 MHz): a 40 MHz VCXO is DOUBLED to 80 MHz. Field: 0 = x1,
+    1 = /2, 2 = /4, 3 = x2."""
+    max_hz = min(max(max_hz, MIN_SYNTH_FREF_HZ), SYNTH_MAX_FREF_HZ)
+    if refin_hz <= max_hz // 2:
+        return 2 * refin_hz, 3
+    if refin_hz <= max_hz:
+        return refin_hz, 0
+    if refin_hz <= 2 * max_hz:
+        return refin_hz // 2, 1
+    if refin_hz <= 4 * max_hz:
+        return refin_hz // 4, 2
+    raise ValueError("reference clock %d Hz out of range" % refin_hz)
+
+
 class AD9361:
-    def __init__(self, bus=1, cs=0, ref_clk_hz=40_000_000):
+    def __init__(self, bus=1, cs=0, ref_clk_hz=40_000_000, synth_max_fref_hz=None):
         self.ref_clk_hz = ref_clk_hz
+        # RF PLL reference after the ref scaler. Vendor: ad9361_ref_div_sel(refin,
+        # trx_synth_max_fref=80 MHz) -> a 40 MHz VCXO is doubled to 80 MHz and the
+        # 80 MHz VCO/loop-filter table is used. P501_SYNTH_MAX_FREF=40008000 in the
+        # environment (or synth_max_fref_hz=) restores the old x1 / 40 MHz behaviour
+        # for A/B comparisons.
+        if synth_max_fref_hz is None:
+            synth_max_fref_hz = int(os.environ.get("P501_SYNTH_MAX_FREF",
+                                                   SYNTH_MAX_FREF_HZ))
+        self.synth_ref_hz, self._synth_ref_scaler = synth_ref_div_sel(
+            ref_clk_hz, synth_max_fref_hz)
+        self._lo_hz = {}
         self.rx2tx2 = False
         self._release_control_gpios()
         self.spi = spidev.SpiDev()
@@ -589,6 +628,14 @@ class AD9361:
         return self.check_cal_done(REG_CH_1_OVERFLOW, BBPLL_LOCK, 1)
 
     # -- sample-rate clock chain -----------------------------------------
+    def _write_synth_ref_scaler(self):
+        """RX/TX RF PLL reference scaler (port of ad9361_set_clk_scaler for
+        RX_REFCLK / TX_REFCLK): 0 = x1, 1 = /2, 2 = /4, 3 = x2."""
+        s = self._synth_ref_scaler
+        self.reg_writef(REG_REF_DIVIDE_CONFIG_1, 1 << 0, s >> 1)  # RX_REF_DIVIDER MSB
+        self.reg_writef(REG_REF_DIVIDE_CONFIG_2, 1 << 7, s & 1)   # RX_REF_DIVIDER LSB
+        self.reg_writef(REG_REF_DIVIDE_CONFIG_2, 0x3 << 2, s)     # TX_REF_DIVIDER
+
     def set_clock_chain(self, adc_div=16, r2_div=2, r1_div=2, clkrf_div=2,
                          rx_fir_div=2, dac_div=1, t2_div=2, t1_div=2,
                          clktf_div=2, tx_fir_div=2):
@@ -600,9 +647,8 @@ class AD9361:
         cases)."""
         import math
 
-        self.reg_write(REG_CLOCK_CTRL, 0)  # REF_FREQ_SCALER=0, no ref scaling
-        self.reg_writef(REG_REF_DIVIDE_CONFIG_1, 1 << 0, 0)  # RX_REF_DIVIDER MSB
-        self.reg_writef(REG_REF_DIVIDE_CONFIG_2, (1 << 7) | (0x3 << 2), 0)
+        self.reg_write(REG_CLOCK_CTRL, 0)  # BBPLL ref scaler x1 (40 MHz <= 70 MHz)
+        self._write_synth_ref_scaler()
 
         self.reg_writef(REG_BBPLL, 0x7, int(math.log2(adc_div)))
         # DAC_CLK = ADC_CLK / dac_div, dac_div in {1, 2} (REG_BBPLL bit 3 =
@@ -633,10 +679,11 @@ class AD9361:
         self.reg_writef(REG_TX_ENABLE_FILTER_CTRL, 0x3 << 0, tx_fir_field)
 
     # -- RFPLL -------------------------------------------------------------
-    def _rfpll_vco_init(self, tx, vco_freq_hz):
+    def _rfpll_vco_init(self, tx, vco_freq_hz, use_fdd_table=False):
         vco_mhz = vco_freq_hz // 1_000_000
-        row = SYNTH_LUT_TDD_40MHZ[-1]
-        for candidate in SYNTH_LUT_TDD_40MHZ:
+        table = synth_lut(self.synth_ref_hz, use_fdd_table)
+        row = table[-1]
+        for candidate in table:
             row = candidate
             if candidate[0] <= vco_mhz:
                 break
@@ -665,7 +712,7 @@ class AD9361:
         """Port of ad9361_calc_rfpll_int_divder + the register-write/poll
         portion of ad9361_rfpll_int_set_rate. tx=False for RX LO,
         tx=True for TX LO."""
-        ref_clk_hz = ref_clk_hz or self.ref_clk_hz
+        ref_clk_hz = ref_clk_hz or self.synth_ref_hz
         freq = freq_hz
         vco_div = -1
         while freq <= MIN_VCO_FREQ_HZ:
@@ -673,7 +720,11 @@ class AD9361:
             vco_div += 1
         vco_freq = freq
 
-        self._rfpll_vco_init(tx, vco_freq)
+        # vendor: FDD table only when RX LO != TX LO, else the TDD table
+        other = self._lo_hz.get("rx" if tx else "tx")
+        self._lo_hz["tx" if tx else "rx"] = freq_hz
+        self._rfpll_vco_init(tx, vco_freq,
+                             use_fdd_table=(other is not None and other != freq_hz))
 
         integer = freq // ref_clk_hz
         rem = freq % ref_clk_hz

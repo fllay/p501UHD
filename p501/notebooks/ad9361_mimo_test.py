@@ -29,6 +29,11 @@ import ad9361_rate_test as rt          # rate presets (reads sys.argv[1] = rate)
 from ad9361_fir_test import make_fir_coef
 
 CFG = rt.CFG
+# REAL_2R2T_30_72: the 30.72 preset in ad9361_rate_test is the 1R1T chain (l_clk = 2*fs = 61.44 MHz).  In 2R2T the data
+# interface needs l_clk = 4*fs, which at 30.72 MS/s means ADC_CLK = 122.88 MHz: use the 61.44 chain with adc_div 8.
+# (With the 1R1T chain the 2R2T stream really runs at 15.36 MS/s per channel -- measured with continuous DMA capture.)
+if rt.RATE == 30.72:
+    CFG.update(adc_div=8, adc_clk=122_880_000, clk=30_720_000, chain=dict(rt.RATES[61.44]["chain"]))
 FS = CFG["fs"]
 N = rt.N
 LOS = [int(float(x) * 1e6) for x in os.environ.get("LOS", "700").split(",")]

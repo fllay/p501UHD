@@ -1,0 +1,8 @@
+kernel/ffs/*.o
+kernel/ffs/*.ko
+kernel/ffs/*.mod*
+kernel/ffs/.*.cmd
+kernel/ffs/Module.symvers
+kernel/ffs/modules.order
+kernel/ffs/ffs_dev
+kernel/ffs/host_bulk

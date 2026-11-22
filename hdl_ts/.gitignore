@@ -1,0 +1,8 @@
+xsim.dir/
+*.wdb
+*.pb
+xsim*.log
+xelab*
+xvlog*
+webtalk*
+.Xil/

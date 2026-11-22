@@ -20,9 +20,10 @@ from pynq import Overlay, allocate
 import ad9361_mimo_test as mt
 
 PORT = int(os.environ.get("P501_PORT", "5555"))
-BIT = os.environ.get("P501_BIT", "base_dmac32/system_top.bit")
+BIT = os.environ.get("P501_BIT", "base_ts/system_top.bit")
 SLOT_MB, NSLOTS, TX_NSLOTS = 4, 16, 8
-VERSION = "1"
+VERSION = "2"
+TIME_PHYS = int(os.environ.get("P501_TIME_PHYS", "0x99030000"), 0) if "base_ts" in BIT else 0
 RX_GAIN_MAX, TX_GAIN_MAX = 76.0, 89.75
 LO_MIN, LO_MAX = 70e6, 6000e6
 
@@ -45,7 +46,7 @@ class Board:
             ["/home/xilinx/p501UHD/kernel/ffs/p501_stream", "/dev/ffs", hex(self.ring.physical_address),
              str(SLOT_MB * 1024 * 1024), str(NSLOTS), hex(o["axi_ad9361_adc_dma"]["phys_addr"]), "0",
              hex(o["axi_ad9361"]["phys_addr"]), hex(self.txring.physical_address),
-             hex(o["axi_ad9361_dac_dma"]["phys_addr"]), str(TX_NSLOTS)])
+             hex(o["axi_ad9361_dac_dma"]["phys_addr"]), str(TX_NSLOTS)] + ([hex(TIME_PHYS)] if TIME_PHYS else []))
 
     def apply(self):
         for i in (0, 1):
@@ -74,7 +75,7 @@ class Board:
         c = t[0]
         ch = int(t[1]) if len(t) > 1 and t[1].lstrip("-").isdigit() else 0
         if c == "info":
-            return f"OK p501 {VERSION} fs={int(mt.FS)} rx=2 tx=2 serial=P501-{os.uname().nodename}"
+            return f"OK p501 {VERSION} fs={int(mt.FS)} rx=2 tx=2 time={1 if TIME_PHYS else 0} serial=P501-{os.uname().nodename}"
         if c in ("get_rx_freq", "get_tx_freq"):
             return f"OK {self.lo}"
         if c in ("set_rx_freq", "set_tx_freq"):

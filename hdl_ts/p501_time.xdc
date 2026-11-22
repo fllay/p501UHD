@@ -1,0 +1,2 @@
+# p501_time: quasi-static / handshake-protected CDC between the AXI clock and the sample clock
+set_false_path -from [get_cells -hier -filter {NAME =~ *p501_time_0* && (NAME =~ *a_lo_reg* || NAME =~ *a_hi_reg* || NAME =~ *b_reg_reg* || NAME =~ *cmd_code_reg* || NAME =~ *late_tol_r_reg* || NAME =~ *cmd_req_t_reg* || NAME =~ *st_ack_t_reg* || NAME =~ *st_data_r_reg* || NAME =~ *st_req_tr_reg* || NAME =~ *cmd_ack_tr_reg*)}]

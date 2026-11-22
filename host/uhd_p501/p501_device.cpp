@@ -51,7 +51,8 @@ static const size_t FRAMES      = 65536;                 // frames per USB messa
 static const size_t PAYLOAD     = FRAMES * 8;            // 512 KiB
 static const uint32_t MAGIC     = 0x31303550;
 static const uint32_t HF_OVR = 1, HF_HWOVF = 2, HF_END = 0x80000000u;
-enum { REQ_RX_START = 1, REQ_RX_STOP = 2, REQ_TX_START = 3, REQ_TX_STOP = 4 };
+enum { REQ_RX_START = 1, REQ_RX_STOP = 2, REQ_TX_START = 3, REQ_TX_STOP = 4, REQ_STATUS = 5, REQ_TIME_GET = 6, REQ_TIME_SET = 7, REQ_RX_START_AT = 8 };
+static const uint32_t HF_TX_TIMED = 4;
 
 #define LOGW(x) UHD_LOG_WARNING("P501", x)
 
@@ -185,6 +186,21 @@ public:
             libusb_free_config_descriptor(cfg);
         if (_ifn < 0 || libusb_claim_interface(_h, _ifn))
             throw uhd::io_error("p501: cannot claim the streaming USB interface");
+        {   // 16 RX x 1 MiB + 12 TX x 512 KiB in flight exceed the default 16 MiB usbfs limit: raise it when allowed
+            long cur = 0;
+            if (FILE* f = fopen("/sys/module/usbcore/parameters/usbfs_memory_mb", "r")) {
+                if (fscanf(f, "%ld", &cur) != 1)
+                    cur = 0;
+                fclose(f);
+            }
+            if (cur > 0 && cur < 64) {
+                if (FILE* f = fopen("/sys/module/usbcore/parameters/usbfs_memory_mb", "w")) {
+                    fprintf(f, "256");
+                    fclose(f);
+                } else
+                    LOGW("usbfs_memory_mb is " << cur << " MiB; run as root or: echo 256 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb");
+            }
+        }
         _run = true;
         _thr = std::thread([this] {
             while (_run) {
@@ -201,11 +217,34 @@ public:
         libusb_close(_h);
         libusb_exit(_ctx);
     }
-    void ctl(int req)
+    void ctl(int req, int wvalue = 0)
     {
-        int r = libusb_control_transfer(_h, 0x41, req, 0, _ifn, nullptr, 0, 2000);
+        int r = libusb_control_transfer(_h, 0x41, req, wvalue, _ifn, nullptr, 0, 2000);
         if (r < 0)
             throw uhd::io_error(std::string("p501: USB control request failed: ") + libusb_error_name(r));
+    }
+    void ctl_out64(int req, uint64_t v)
+    {
+        std::lock_guard<std::mutex> l(_cm);
+        int r = libusb_control_transfer(_h, 0x41, req, 0, _ifn, (unsigned char*)&v, 8, 2000);
+        if (r < 0)
+            throw uhd::io_error(std::string("p501: USB control request failed: ") + libusb_error_name(r));
+    }
+    uint64_t ctl_in64(int req)
+    {
+        std::lock_guard<std::mutex> l(_cm);
+        uint64_t v = 0;
+        int r = libusb_control_transfer(_h, 0xC1, req, 0, _ifn, (unsigned char*)&v, 8, 2000);
+        if (r != 8)
+            throw uhd::io_error("p501: time read failed");
+        return v;
+    }
+    // board status block: rx_slots rx_hwovf rx_msgs tx_filled tx_submitted tx_unf tx_bad tx_msgs pl_ts pl_done pl_late pl_unf
+    bool status(uint64_t out[12])
+    {
+        std::lock_guard<std::mutex> l(_cm);
+        int r = libusb_control_transfer(_h, 0xC1, REQ_STATUS, 0, _ifn, (unsigned char*)out, 96, 1000);
+        return r == 96;
     }
     libusb_device_handle* h() { return _h; }
     unsigned char epin() const { return _epin; }
@@ -218,6 +257,7 @@ private:
     unsigned char _epin = 0, _epout = 0;
     std::atomic<bool> _run{false};
     std::thread _thr;
+    std::mutex _cm;
 };
 
 // state shared by the device and its streamers
@@ -234,7 +274,15 @@ struct shared_t {
     }
     std::vector<size_t> rx_map{0, 1}, tx_map{0, 1};
     std::atomic<double> time_offset{0.0};
-    double now() const { return steady_s() + time_offset.load(); }
+    bool hw_time = false;
+    uint64_t ticks_now() { return get_usb().ctl_in64(REQ_TIME_GET); }
+    void set_ticks(uint64_t t) { get_usb().ctl_out64(REQ_TIME_SET, t); }
+    time_spec_t now()
+    {
+        if (hw_time)
+            return time_spec_t::from_ticks((long long)ticks_now(), FS);
+        return time_spec_t(steady_s() + time_offset.load());
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -294,19 +342,21 @@ public:
     void issue_stream_cmd(const stream_cmd_t& cmd) override
     {
         std::lock_guard<std::mutex> l(_cmd_m);
-        if (!cmd.stream_now && !_warned) {
+        bool timed = !cmd.stream_now && _sh->hw_time;
+        long long start = timed ? cmd.time_spec.to_ticks(FS) : 0;
+        if (!cmd.stream_now && !_sh->hw_time && !_warned) {
             _warned = true;
             LOGW("timed stream commands are not supported (no hardware time): streaming starts now");
         }
         switch (cmd.stream_mode) {
             case stream_cmd_t::STREAM_MODE_START_CONTINUOUS:
-                start_stream(0, false);
+                start_stream(0, false, timed, start);
                 break;
             case stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE:
-                start_stream(cmd.num_samps, true);
+                start_stream(cmd.num_samps, true, timed, start);
                 break;
             case stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_MORE:
-                start_stream(cmd.num_samps, false);
+                start_stream(cmd.num_samps, false, timed, start);
                 break;
             case stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS:
                 stop_stream();
@@ -318,6 +368,7 @@ public:
         const bool one_packet = false) override
     {
         md = rx_metadata_t();
+        retry_submits();
         if (!_active) {
             md.error_code = rx_metadata_t::ERROR_CODE_TIMEOUT;
             std::this_thread::sleep_for(std::chrono::duration<double>(std::min(timeout, 0.01)));
@@ -337,7 +388,7 @@ public:
                         _ovf_pending = false;
                         md.error_code = rx_metadata_t::ERROR_CODE_OVERFLOW;
                         md.has_time_spec = true;
-                        md.time_spec = time_spec_t(_sh->now());
+                        md.time_spec = _sh->now();
                         return 0;
                     }
                     break; // deliver what we have; the overflow is reported by the next call
@@ -345,7 +396,10 @@ public:
             }
             if (done == 0) {
                 md.has_time_spec = true;
-                md.time_spec = time_spec_t(_t0 + double(_samps_out) / FS);
+                if (_sh->hw_time)
+                    md.time_spec = time_spec_t::from_ticks((long long)(_msg_ts + _off), FS);
+                else
+                    md.time_spec = time_spec_t(_t0 + double(_samps_out) / FS);
             }
             size_t n = std::min(nsamps - done, _frames - _off);
             if (_finite)
@@ -407,12 +461,28 @@ private:
     void submit(libusb_transfer* t)
     {
         _outstanding++;
-        if (libusb_submit_transfer(t))
+        if (libusb_submit_transfer(t)) {
             _outstanding--;
+            std::lock_guard<std::mutex> l(_rm);
+            _retry.push_back(t); // e.g. usbfs memory limit: resubmitted from the receive path
+        }
+    }
+    void retry_submits()
+    {
+        std::deque<libusb_transfer*> r;
+        {
+            std::lock_guard<std::mutex> l(_rm);
+            if (_retry.empty())
+                return;
+            r.swap(_retry);
+        }
+        for (auto* t : r)
+            submit(t);
     }
 
     bool next_msg(double timeout)
     {
+        retry_submits();
         std::unique_lock<std::mutex> l(_m);
         if (!_cv.wait_for(l, std::chrono::duration<double>(timeout), [&] { return !_q.empty(); }))
             return false;
@@ -425,6 +495,7 @@ private:
         if (h->flags & (HF_OVR | HF_HWOVF))
             _ovf_pending = true;
         _have_seq = true;
+        _msg_ts   = h->chunk;
         _next_seq = h->seq + 1;
         _off      = 0;
         _frames   = std::min<size_t>(FRAMES, (_cur->actual_length - sizeof(hdr_t)) / 8);
@@ -459,7 +530,7 @@ private:
         }
     }
 
-    void start_stream(uint64_t nsamps, bool stop_when_done)
+    void start_stream(uint64_t nsamps, bool stop_when_done, bool timed = false, long long start_ticks = 0)
     {
         if (_active)
             stop_stream_locked();
@@ -474,8 +545,11 @@ private:
         _finite = nsamps > 0;
         _remaining = nsamps;
         _stop_when_done = stop_when_done;
-        _t0 = _sh->now();
-        _sh->get_usb().ctl(REQ_RX_START);
+        _t0 = _sh->hw_time ? 0.0 : _sh->now().get_real_secs();
+        if (timed)
+            _sh->get_usb().ctl_out64(REQ_RX_START_AT, (uint64_t)start_ticks);
+        else
+            _sh->get_usb().ctl(REQ_RX_START);
         _active = true;
     }
     void stop_stream()
@@ -517,7 +591,8 @@ private:
     std::vector<libusb_transfer*> _xfers;
     std::mutex _m, _cmd_m, _stop_m;
     std::condition_variable _cv;
-    std::deque<libusb_transfer*> _q;
+    std::deque<libusb_transfer*> _q, _retry;
+    std::mutex _rm;
     std::atomic<int> _outstanding{0};
     std::atomic<int> _fails{0};
     std::atomic<bool> _dead{false}, _active{false};
@@ -527,6 +602,7 @@ private:
     bool _have_seq = false, _ovf_pending = false, _finite = false, _stop_when_done = false;
     uint64_t _next_seq = 0, _remaining = 0, _samps_out = 0;
     double _t0 = 0;
+    uint64_t _msg_ts = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -561,10 +637,35 @@ public:
 
     size_t get_num_channels() const override { return _chans.size(); }
     size_t get_max_num_samps() const override { return FRAMES; }
-    bool recv_async_msg(async_metadata_t&, double timeout = 0.1) override
+    bool recv_async_msg(async_metadata_t& md, double timeout = 0.1) override
     {
-        std::this_thread::sleep_for(std::chrono::duration<double>(std::min(timeout, 0.1)));
-        return false;
+        const double tend = steady_s() + timeout;
+        for (;;) {
+            if (_started && !_dead) {
+                uint64_t st[12];
+                if (_sh->get_usb().status(st)) {
+                    uint64_t late = st[10], unf = st[5] + st[11];
+                    md = async_metadata_t();
+                    md.channel = 0;
+                    md.has_time_spec = _sh->hw_time;
+                    if (_sh->hw_time)
+                        md.time_spec = time_spec_t::from_ticks((long long)st[8], FS);
+                    if (late > _seen_late) {
+                        _seen_late = late;
+                        md.event_code = async_metadata_t::EVENT_CODE_TIME_ERROR;
+                        return true;
+                    }
+                    if (unf > _seen_unf) {
+                        _seen_unf = unf;
+                        md.event_code = async_metadata_t::EVENT_CODE_UNDERFLOW;
+                        return true;
+                    }
+                }
+            }
+            if (steady_s() >= tend)
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 
     void shutdown()
@@ -603,13 +704,19 @@ public:
 
     size_t send(const buffs_type& buffs, const size_t nsamps, const tx_metadata_t& md, const double timeout = 0.1) override
     {
-        if (md.has_time_spec && !_warned) {
+        if (md.has_time_spec && !_sh->hw_time && !_warned) {
             _warned = true;
             LOGW("timed TX bursts are not supported (no hardware time): samples are played as they arrive");
         }
         if (!_started) {
-            _sh->get_usb().ctl(REQ_TX_START);
+            _sh->get_usb().ctl(REQ_TX_START, _sh->hw_time ? 1 : 0);
             _started = true;
+        }
+        if (md.has_time_spec && _sh->hw_time) {
+            if (_cur && _fill > 0)
+                flush();
+            _burst_timed = true;
+            _next_ticks  = (uint64_t)md.time_spec.to_ticks(FS);
         }
         const double tend = steady_s() + timeout;
         size_t done = 0;
@@ -624,7 +731,9 @@ public:
                 flush();
         }
         if (md.end_of_burst && _cur && _fill > 0)
-            flush(); // the rest of the message is already zero
+            flush(); // untimed: the rest of the message is already zero; timed: a short message
+        if (md.end_of_burst)
+            _burst_timed = false;
         return done;
     }
 
@@ -632,6 +741,8 @@ private:
     static void LIBUSB_CALL cb(libusb_transfer* t)
     {
         auto* s = (tx_streamer_impl*)t->user_data;
+        if (getenv("P501_DEBUG") && (t->status != LIBUSB_TRANSFER_COMPLETED || t->actual_length != t->length))
+            fprintf(stderr, "TXCB status=%d actual=%d len=%d\n", (int)t->status, t->actual_length, t->length);
         {
             std::lock_guard<std::mutex> l(s->_m);
             s->_inflight--;
@@ -649,6 +760,7 @@ private:
         _free.pop_front();
         l.unlock();
         memset(_cur->buffer + sizeof(hdr_t), 0, PAYLOAD);
+        _cur->length = (int)(sizeof(hdr_t) + PAYLOAD);
         _fill = 0;
         return true;
     }
@@ -660,11 +772,26 @@ private:
         h->hdr_len     = sizeof *h;
         h->seq         = _seq++;
         h->payload_len = PAYLOAD;
+        if (_burst_timed) {
+            size_t frames = _fill + (_fill & 1); // even frame count; the buffer tail is zero
+            h->flags       = HF_TX_TIMED;
+            h->chunk       = _next_ticks;
+            h->payload_len = (uint32_t)(frames * 8);
+            _cur->length   = (int)(sizeof(hdr_t) + frames * 8);
+            _next_ticks += frames;
+        }
+        if (getenv("P501_DEBUG") && h->seq < 12)
+            fprintf(stderr, "TXMSG seq=%llu burst_timed=%d chunk=%llu payload=%u fill=%zu\n", (unsigned long long)h->seq, (int)_burst_timed, (unsigned long long)h->chunk, h->payload_len, _fill);
         libusb_transfer* t = _cur;
         _cur  = nullptr;
         _fill = 0;
         _inflight++;
-        if (libusb_submit_transfer(t)) {
+        int sr = libusb_submit_transfer(t);
+        for (int i = 0; sr == LIBUSB_ERROR_NO_MEM && i < 2000; i++) { // usbfs memory limit: wait for a transfer to complete, never drop a message
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            sr = libusb_submit_transfer(t);
+        }
+        if (sr) {
             _inflight--;
             std::lock_guard<std::mutex> l(_m);
             _free.push_back(t);
@@ -697,7 +824,8 @@ private:
     }
 
     std::shared_ptr<shared_t> _sh;
-    bool _fc32 = true, _started = false, _warned = false;
+    bool _fc32 = true, _started = false, _warned = false, _burst_timed = false;
+    uint64_t _next_ticks = 0, _seen_late = 0, _seen_unf = 0;
     std::vector<size_t> _chans;
     std::vector<libusb_transfer*> _xfers;
     std::deque<libusb_transfer*> _free;
@@ -721,6 +849,9 @@ public:
         _sh = std::make_shared<shared_t>();
         _sh->ctrl.reset(new ctrl_t(args.get("addr", DEFAULT_ADDR), DEFAULT_PORT, 3.0));
         _info = _sh->ctrl->call("info");
+        for (auto& t : _info)
+            if (t == "time=1")
+                _sh->hw_time = true;
         _build_tree();
     }
     ~p501_device() override
@@ -797,12 +928,16 @@ void p501_device::_build_tree()
     _tree->create<double>(mb / "link_max_rate").set(500e6);
 
     // time: the host clock (no hardware timekeeper in v1)
-    _tree->create<time_spec_t>(mb / "time/now")
-        .set_publisher([sh] { return time_spec_t(sh->now()); })
-        .add_coerced_subscriber([sh](const time_spec_t& t) { sh->time_offset = t.get_real_secs() - steady_s(); });
+    auto set_time = [sh](const time_spec_t& t) {
+        if (sh->hw_time)
+            sh->set_ticks((uint64_t)t.to_ticks(FS));
+        else
+            sh->time_offset = t.get_real_secs() - steady_s();
+    };
+    _tree->create<time_spec_t>(mb / "time/now").set_publisher([sh] { return sh->now(); }).add_coerced_subscriber(set_time);
     _tree->create<time_spec_t>(mb / "time/pps")
-        .set_publisher([sh] { return time_spec_t(std::floor(sh->now())); })
-        .add_coerced_subscriber([sh](const time_spec_t& t) { sh->time_offset = t.get_real_secs() - steady_s(); });
+        .set_publisher([sh] { return time_spec_t(std::floor(sh->now().get_real_secs())); })
+        .add_coerced_subscriber(set_time);
     _tree->create<time_spec_t>(mb / "time/cmd").set(time_spec_t(0.0));
     for (const std::string kind : {"clock", "time"}) {
         _tree->create<std::vector<std::string>>(mb / (kind + "_source") / "options")

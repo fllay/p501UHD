@@ -1227,7 +1227,7 @@ class AD9361:
         r["rf_dc"] = self.rf_dc_offset_calib(rx_freq_hz)
         r["tx_quad"] = self.tx_quad_calib(rx_bb, tx_bb, clkrf_hz=clkrf_hz,
                                            clktf_hz=clktf_hz)
-        if tracking:
+        if tracking or os.environ.get("P501_TRACKING") == "1":
             self.tracking_control(True, True, True)
         return r
 

@@ -100,8 +100,11 @@ static inline void civac(void *p, size_t n) {
 	asm volatile("dsb sy" ::: "memory");
 }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#define SENT 0x7777777777777777ULL
+static uint64_t premature = 0;
 static int submit(int slot) {
 	if (dma[REG_START_TRANSFER / 4]) return -1;                 // hardware queue full
+	{ uint64_t *sp = (uint64_t *)(ring + (size_t)slot * slot_bytes + slot_bytes - 64); for (int i = 0; i < 8; i++) sp[i] = SENT; civac(sp, 64); }
 	dma[REG_DEST_ADDRESS / 4] = (uint32_t)(ring_phys + (uint64_t)slot * slot_bytes);
 	dma[REG_X_LENGTH / 4] = slot_bytes - 1; dma[REG_Y_LENGTH / 4] = 0; dma[REG_FLAGS / 4] = 2;   // FLAG_LAST
 	int tid = dma[REG_TRANSFER_ID / 4] & 0x3;
@@ -124,13 +127,14 @@ static void *stream_thread(void *a)
 			tid_of[nsub % nslots] = t; done[nsub % nslots] = 0; nsub++; pending++;
 		}
 		uint32_t m = dma[REG_TRANSFER_DONE / 4];
-		for (uint64_t k = nsend; k < nsub; k++) { int s = k % nslots; if (!done[s] && (m & (1u << tid_of[s]))) { done[s] = 1; pending--; } }
+		for (uint64_t k = nsend; k < nsub; k++) { int s = k % nslots; if (!done[s]) { uint64_t *sp = (uint64_t *)(ring + (size_t)s * slot_bytes + slot_bytes - 64); civac(sp, 64); if (sp[0] != SENT || sp[7] != SENT) { done[s] = 1; pending--; } } }
 		if (pending == 0 && nsub > nsend + 0 && done[nsend % nslots] == 0) { }
 		int c1 = (nsub == nsend), c2 = (pending == 0 && nsub - nsend >= (uint64_t)nslots);
 		if (c2) { overruns++; ovr_flag = 1; if (overruns <= 12) { printf("OVR#%u c1=%d c2=%d nsub=%llu nsend=%llu pending=%d mask=%x t=%.3f\n", overruns, c1, c2, (unsigned long long)nsub, (unsigned long long)nsend, pending, m, now() - t0); fflush(stdout); } }   // nothing queued while the ADC keeps running (or ring full)
 		if (nsub > nsend && done[nsend % nslots]) {
 			int s = nsend % nslots; char *base = ring + (size_t)s * slot_bytes;
 			civac(base, slot_bytes);
+			{ uint64_t *sp = (uint64_t *)(base + slot_bytes - 64); if (sp[0] == SENT && sp[7] == SENT) { premature++; if (premature <= 20) { printf("PREMATURE slot=%d nsend=%llu nsub=%llu pending=%d mask=%x t=%.3f\n", s, (unsigned long long)nsend, (unsigned long long)nsub, pending, m, now() - t0); fflush(stdout); } } }
 			for (size_t off = 0; off < slot_bytes; off += PAYLOAD) {
 				struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = seq++, .payload_len = PAYLOAD, .flags = ovr_flag, .chunk = nsend, .overruns = overruns, .slot_off = (uint32_t)off };
 				ovr_flag = 0;
@@ -144,7 +148,7 @@ static void *stream_thread(void *a)
 	}
 out:
 	dma[REG_CTRL / 4] = 0;
-	printf("done: %llu chunks, %llu MB, overruns %u\n", (unsigned long long)nsend, (unsigned long long)(bytes / 1000000), overruns); fflush(stdout);
+	printf("premature total %llu\n", (unsigned long long)premature); printf("done: %llu chunks, %llu MB, overruns %u\n", (unsigned long long)nsend, (unsigned long long)(bytes / 1000000), overruns); fflush(stdout);
 	exit(0);
 	return NULL;
 }

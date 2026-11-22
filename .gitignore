@@ -8,3 +8,4 @@ kernel/ffs/ffs_dev
 kernel/ffs/host_bulk
 kernel/ffs/host_loop
 kernel/ffs/host_verify
+host/uhd_p501/build/

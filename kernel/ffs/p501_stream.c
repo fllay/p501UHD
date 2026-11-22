@@ -163,42 +163,65 @@ out:
 	rx_alive = 0; return NULL;
 }
 
+#define TX_PRIME_MSGS 16
+#define TX_MAX_MSGS_PER_XFER 8
+#define MAGIC 0x31303550
+static int tx_ring_msgs;
+static volatile uint64_t tx_released_v; static volatile double tx_last_fill;
+
 static void *tx_reader(void *a)
 {
 	uint64_t filled = 0;
 	while (tx_run) {
-		while (tx_run && filled >= (tx_submitted_v > 4 ? tx_submitted_v - 4 : 0) + (uint64_t)tx_nslots) usleep(100);   // ring full
-		char *base = tx_ring + (size_t)(filled % tx_nslots) * slot_bytes;
-		for (size_t off = 0; off < slot_bytes && tx_run; ) {
-			struct hdr h; struct iovec iov[2] = { { &h, sizeof h }, { base + off, PAYLOAD } };
-			ssize_t n = readv(ep_out, iov, 2);
-			if (n < 0) { if (errno == EINTR) continue; perror("readv ep2"); tx_run = 0; break; }
-			if (n >= (ssize_t)sizeof h && h.magic == 0x31303550 && (h.flags & HF_END)) { tx_run = 0; break; }
-			if (n != (ssize_t)(sizeof h + PAYLOAD) || h.magic != 0x31303550) { st.tx_bad++; continue; }
-			st.tx_msgs++; off += PAYLOAD;
-		}
+		while (tx_run && filled >= tx_released_v + (uint64_t)tx_ring_msgs) usleep(100);        // ring full
 		if (!tx_run) break;
-		civac(base, slot_bytes);
-		filled++; tx_filled_v = filled; st.tx_filled = filled;
+		char *base = tx_ring + (size_t)(filled % tx_ring_msgs) * PAYLOAD;
+		struct hdr h; struct iovec iov[2] = { { &h, sizeof h }, { base, PAYLOAD } };
+		ssize_t n = readv(ep_out, iov, 2);
+		if (n < 0) { if (errno == EINTR) continue; perror("readv ep2"); break; }
+		if (n >= (ssize_t)sizeof h && h.magic == MAGIC && (h.flags & HF_END)) break;
+		if (n != (ssize_t)(sizeof h + PAYLOAD) || h.magic != MAGIC) { st.tx_bad++; continue; }
+		civac(base, PAYLOAD);
+		filled++; tx_filled_v = filled; st.tx_filled = filled; st.tx_msgs++; tx_last_fill = now();
 	}
 	tx_run = 0; __atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
 }
 
+static int submit_tx(uint64_t msg, uint64_t nmsgs)
+{
+	if (ddma[REG_START_TRANSFER / 4]) return -1;
+	ddma[REG_SRC_ADDRESS / 4] = (uint32_t)(tx_phys + msg * PAYLOAD);
+	ddma[REG_X_LENGTH / 4] = nmsgs * PAYLOAD - 1; ddma[REG_Y_LENGTH / 4] = 0; ddma[REG_FLAGS / 4] = 2;
+	ddma[REG_START_TRANSFER / 4] = 1;
+	return 0;
+}
+
+// Feeds the DAC DMAC with whatever contiguous messages are available (up to a slot per transfer). Playback starts once
+// TX_PRIME_MSGS are queued, or when data has been waiting 20 ms (a short burst).
 static void *tx_submitter(void *a)
 {
-	uint64_t submitted = 0; int primed = 0; int cnt = 0;
+	uint64_t sub = 0, xfers = 0, ends[8] = {0}; int primed = 0, cnt = 0;
 	a9361[0x4088 / 4] = 1;                                        // clear sticky DAC underflow
 	ddma[REG_CTRL / 4] = 1;
 	while (tx_run) {
 		uint64_t f = tx_filled_v;
-		if (!primed) { if (f >= TX_PRIME) { primed = 1; a9361[0x4088 / 4] = 1; } else { usleep(200); continue; } }
-		if (submitted < f && submit(1, submitted % tx_nslots) == 0) { submitted++; tx_submitted_v = submitted; st.tx_submitted = submitted; }
-		else usleep(50);
-		if (primed && (++cnt & 15) == 0 && (a9361[0x4088 / 4] & 1)) { a9361[0x4088 / 4] = 1; st.tx_unf++; if (st.tx_unf <= 20) { printf("TXUNF submitted=%llu filled=%llu\n", (unsigned long long)submitted, (unsigned long long)f); fflush(stdout); } }
+		if (!primed) {
+			if (f - sub >= TX_PRIME_MSGS || (f > sub && now() - tx_last_fill > 0.02)) { primed = 1; a9361[0x4088 / 4] = 1; }
+			else { usleep(200); continue; }
+		}
+		if (f > sub) {
+			uint64_t n = f - sub, room = tx_ring_msgs - (sub % tx_ring_msgs);
+			if (n > room) n = room; if (n > TX_MAX_MSGS_PER_XFER) n = TX_MAX_MSGS_PER_XFER;
+			if (submit_tx(sub % tx_ring_msgs, n) == 0) {
+				sub += n; xfers++; ends[xfers % 8] = sub; tx_submitted_v = sub; st.tx_submitted = sub;
+				if (xfers >= 4) tx_released_v = ends[(xfers - 4) % 8];        // transfers older than the 4-deep queue are done
+			} else usleep(50);
+		} else usleep(50);
+		if ((++cnt & 15) == 0 && (a9361[0x4088 / 4] & 1)) { a9361[0x4088 / 4] = 1; st.tx_unf++; }
 	}
 	ddma[REG_CTRL / 4] = 0;
-	tx_submitted_v = 0; tx_filled_v = 0;
-	printf("tx stopped: filled %llu submitted %llu unf %llu bad %llu\n", (unsigned long long)st.tx_filled, (unsigned long long)st.tx_submitted, (unsigned long long)st.tx_unf, (unsigned long long)st.tx_bad); fflush(stdout);
+	tx_submitted_v = 0; tx_filled_v = 0; tx_released_v = 0;
+	printf("tx stopped: msgs %llu submitted %llu unf %llu bad %llu\n", (unsigned long long)st.tx_msgs, (unsigned long long)st.tx_submitted, (unsigned long long)st.tx_unf, (unsigned long long)st.tx_bad); fflush(stdout);
 	__atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
 }
 
@@ -208,7 +231,7 @@ static void start_rx(void) { pthread_t t; if (rx_alive || ep_in < 0) return; rx_
 static void start_tx(void)
 {
 	pthread_t t1, t2; if (tx_alive || ep_out < 0) return;
-	memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = 0;
+	memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = tx_released_v = 0; tx_last_fill = now();
 	tx_alive = 2; tx_run = 1; pthread_create(&t1, NULL, tx_reader, NULL); pthread_detach(t1); pthread_create(&t2, NULL, tx_submitter, NULL); pthread_detach(t2);
 }
 
@@ -217,7 +240,7 @@ int main(int argc, char **argv)
 	if (argc < 11) { fprintf(stderr, "usage: %s ffsdir rx_ring_phys slot_bytes nslots adc_dma_phys secs ad9361_phys tx_ring_phys dac_dma_phys tx_nslots\n", argv[0]); return 1; }
 	snprintf(dir, sizeof dir, "%s", argv[1]); rx_phys = strtoull(argv[2], 0, 0); slot_bytes = strtoull(argv[3], 0, 0); nslots = atoi(argv[4]);
 	uint64_t adc_dma = strtoull(argv[5], 0, 0); run_secs_g = atof(argv[6]); uint64_t a9361_phys = strtoull(argv[7], 0, 0);
-	tx_phys = strtoull(argv[8], 0, 0); uint64_t dac_dma = strtoull(argv[9], 0, 0); tx_nslots = atoi(argv[10]);
+	tx_phys = strtoull(argv[8], 0, 0); uint64_t dac_dma = strtoull(argv[9], 0, 0); tx_nslots = atoi(argv[10]); tx_ring_msgs = tx_nslots * (int)(slot_bytes / PAYLOAD);
 	int mfd = open("/dev/mem", O_RDWR | O_SYNC); if (mfd < 0) { perror("/dev/mem"); return 1; }
 	adma = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, adc_dma); ddma = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, dac_dma);
 	a9361 = mmap(0, 0x8000, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, a9361_phys);
@@ -232,7 +255,7 @@ int main(int argc, char **argv)
 	if (write(ep0, &strings, sizeof strings) < 0) { perror("write strings"); return 1; }
 	printf("descriptors written\n"); fflush(stdout);
 	{ FILE *f = fopen("/tmp/stream_ready", "w"); if (f) fclose(f); }
-	{ pthread_t w; pthread_create(&w, NULL, watchdog, NULL); pthread_detach(w); }
+	if (run_secs_g > 0) { pthread_t w; pthread_create(&w, NULL, watchdog, NULL); pthread_detach(w); }
 	for (;;) {
 		struct usb_functionfs_event ev; ssize_t n = read(ep0, &ev, sizeof ev); if (n <= 0) { perror("ep0 read"); break; }
 		if (ev.type == FUNCTIONFS_ENABLE) {

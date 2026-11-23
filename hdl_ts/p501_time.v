@@ -11,7 +11,7 @@
 //
 // AXI-lite map (32 bit, byte addresses)
 //   00 ID 'P501'  04 VERSION  08 A_LO  0C A_HI  10 B  14 CMD(w)/BUSY(r)  18 STATUS  1C TS_LO(r, latches TS_HI)  20 TS_HI
-//   24 RXFIRST_LO(r, latches)  28 RXFIRST_HI  2C TX_DONE  30 TX_LATE  34 TX_UNF  38 LATE_TOL(rw, ticks)
+//   24 RXFIRST_LO(r, latches)  28 RXFIRST_HI  2C TX_DONE  30 TX_LATE  34 TX_UNF  38 LATE_TOL(rw, ticks)  3C RF_SW(rw, 4 bit)
 // Commands (write the code to CMD after A/B are set, wait BUSY=0 before changing A/B/CMD again)
 //   1 SET_TS(A)  2 RX_ARM(A=start)  3 RX_STOP  4 RX_MODE(B: bit0 timed, bit1 tag)  5 TX_MODE(B bit0 timed; flushes)
 //   6 TX_PUSH(A=start, B=frames)  7 CLEAR (sticky flags + counters)  8 TX_FLUSH
@@ -61,13 +61,16 @@ module p501_time (
   input         tx_up_unf,
   output [15:0] tx_out_data_0, output [15:0] tx_out_data_1, output [15:0] tx_out_data_2, output [15:0] tx_out_data_3,
   output        tx_out_valid,
-  output        tx_out_unf
+  output        tx_out_unf,
+  output [3:0]  rf_sw          // RF switch controls: 0 TRX1-nTX-RX(AD11) 1 RX1-TRX-nRX(AB11) 2 TRX2-TX-nRX(AD10) 3 RX2-nTRX-RX(AC11)
 );
 
   // =====================================================================
   // AXI clock domain
   // =====================================================================
   reg [31:0] a_lo, a_hi, b_reg, late_tol_r;
+  reg [3:0]  rf_sw_r = 4'b1100;
+  assign rf_sw = rf_sw_r;
   reg [3:0]  cmd_code;
   reg        cmd_req_t = 1'b0;
   (* ASYNC_REG = "TRUE" *) reg cmd_ack_s1, cmd_ack_s2;
@@ -109,7 +112,7 @@ module p501_time (
   always @(posedge s_axi_aclk) begin
     if (!s_axi_aresetn) begin
       s_axi_bvalid <= 1'b0; cmd_code <= 4'd0;
-      a_lo <= 0; a_hi <= 0; b_reg <= 0; late_tol_r <= 32'd64;
+      a_lo <= 0; a_hi <= 0; b_reg <= 0; late_tol_r <= 32'd64; rf_sw_r <= 4'b1100;
     end else begin
       if (s_axi_bvalid & s_axi_bready) s_axi_bvalid <= 1'b0;
       if (wr_go) begin
@@ -120,6 +123,7 @@ module p501_time (
           6'h04: b_reg <= s_axi_wdata;
           6'h05: if (!cmd_busy) begin cmd_code <= s_axi_wdata[3:0]; cmd_req_t <= ~cmd_req_t; end
           6'h0e: late_tol_r <= s_axi_wdata;
+          6'h0f: rf_sw_r <= s_axi_wdata[3:0];
           default: ;
         endcase
       end
@@ -151,6 +155,7 @@ module p501_time (
           6'h0c: s_axi_rdata <= sh_late;
           6'h0d: s_axi_rdata <= sh_unf;
           6'h0e: s_axi_rdata <= late_tol_r;
+          6'h0f: s_axi_rdata <= {28'd0, rf_sw_r};
           default: s_axi_rdata <= 32'd0;
         endcase
       end
@@ -169,8 +174,9 @@ module p501_time (
   reg [63:0] rx_start, rx_first;
   reg        rx_armed, rx_timed, rx_tag, rx_first_seen;
   reg        tx_timed;
-  reg        in_win, discard;
-  reg [31:0] win_left;
+  reg        discard;
+  reg [31:0] pend;       // frames still owed to the DAC by the descriptors started so far (counted on valid data only)
+  wire       in_win = (pend != 32'd0);
   reg        req_d, pull_d, disc_d;
   reg        late_s, unf_s, ovf_s;
   reg [31:0] tx_done, tx_late, tx_unf;
@@ -196,16 +202,22 @@ module p501_time (
   wire c_flush  = cmd_pulse & (cmd_code == 4'd8);
 
   // ---- TX window state machine
-  wire last_pull  = in_win & tx_req & (win_left == 32'd1);
-  wire can_start  = ~in_win | last_pull;
-  wire due        = head_valid & (ts >= head_ts);
-  wire start      = tx_timed & due & can_start & ~c_flush;
+  // A window frame counts only when the upstream really returned data (valid one cycle after the pull). Starved pulls are
+  // simply repeated, so the data stream and the descriptors can never slip against each other (late/discarded bursts too).
+  wire got        = tx_timed & pull_d & tx_up_valid;
+  wire [31:0] pend_eff = pend - {31'd0, got};
+  wire want       = (pend_eff != 32'd0);
+  wire last_pull  = tx_req & (pend_eff == 32'd1);
   wire [63:0] late_by = ts - head_ts;
   wire is_late    = (late_by > {32'd0, late_tol_r});
+  // contiguous bursts chain without a gap, but never into a discard window (a starved last frame of the previous burst would be swallowed)
+  wire can_start  = (pend_eff == 32'd0) | (last_pull & ~is_late);
+  wire due        = head_valid & (ts >= head_ts);
+  wire start      = tx_timed & due & can_start & ~c_flush;
 
-  assign tx_pull = tx_timed ? (tx_req & in_win) : tx_req;
+  assign tx_pull = tx_timed ? (tx_req & want) : tx_req;
 
-  wire pass_data  = tx_timed ? (pull_d & ~disc_d) : 1'b1;
+  wire pass_data  = tx_timed ? (pull_d & ~disc_d & tx_up_valid) : 1'b1;
   assign tx_out_data_0 = pass_data ? tx_up_data_0 : 16'd0;
   assign tx_out_data_1 = pass_data ? tx_up_data_1 : 16'd0;
   assign tx_out_data_2 = pass_data ? tx_up_data_2 : 16'd0;
@@ -221,7 +233,7 @@ module p501_time (
     req_s <= {req_s[1:0], cmd_req_t};
     if (!fs_resetn) begin
       ts <= 64'd0; rx_armed <= 1'b0; rx_timed <= 1'b0; rx_tag <= 1'b0; rx_first_seen <= 1'b0; rx_first <= 64'd0; rx_start <= 64'd0;
-      tx_timed <= 1'b0; in_win <= 1'b0; discard <= 1'b0; win_left <= 32'd0; wr_ptr <= 6'd0; rd_ptr <= 6'd0;
+      tx_timed <= 1'b0; pend <= 32'd0; discard <= 1'b0; wr_ptr <= 6'd0; rd_ptr <= 6'd0;
       req_d <= 1'b0; pull_d <= 1'b0; disc_d <= 1'b0; late_s <= 1'b0; unf_s <= 1'b0; ovf_s <= 1'b0;
       tx_done <= 32'd0; tx_late <= 32'd0; tx_unf <= 32'd0;
       rx_out_valid <= 1'b0;
@@ -244,8 +256,8 @@ module p501_time (
       req_d  <= tx_req;
       pull_d <= tx_pull & tx_timed;
       disc_d <= discard;
-      if (c_txmode) begin tx_timed <= b_reg[0]; in_win <= 1'b0; wr_ptr <= 6'd0; rd_ptr <= 6'd0; end
-      if (c_flush)  begin in_win <= 1'b0; wr_ptr <= 6'd0; rd_ptr <= 6'd0; end
+      if (c_txmode) begin tx_timed <= b_reg[0]; wr_ptr <= 6'd0; rd_ptr <= 6'd0; end
+      if (c_flush)  begin wr_ptr <= 6'd0; rd_ptr <= 6'd0; end
       if (c_push) begin
         if (dcount >= 6'd32) ovf_s <= 1'b1;
         else begin dmem[wr_ptr[4:0]] <= {a_arg, b_reg}; wr_ptr <= wr_ptr + 6'd1; end
@@ -254,13 +266,12 @@ module p501_time (
         rd_ptr  <= rd_ptr + 6'd1;
         discard <= is_late;
         if (is_late) begin late_s <= 1'b1; tx_late <= tx_late + 32'd1; end
-        in_win  <= (head_len != 32'd0);
-        win_left <= head_len;
-        if (last_pull & ~discard) tx_done <= tx_done + 32'd1;
-      end else if (in_win & tx_req) begin
-        win_left <= win_left - 32'd1;
-        if (win_left == 32'd1) begin in_win <= 1'b0; if (~discard) tx_done <= tx_done + 32'd1; end
+        else tx_done <= tx_done + 32'd1;
+        pend    <= pend_eff + head_len;
+      end else begin
+        pend    <= pend_eff;
       end
+      if (c_txmode | c_flush) pend <= 32'd0;
       if (unf_now) begin unf_s <= 1'b1; tx_unf <= tx_unf + 32'd1; end
       if (c_clear) begin late_s <= 1'b0; unf_s <= 1'b0; ovf_s <= 1'b0; tx_done <= 32'd0; tx_late <= 32'd0; tx_unf <= 32'd0; end
     end

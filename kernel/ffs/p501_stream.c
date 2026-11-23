@@ -15,6 +15,8 @@
 #include <sys/uio.h>
 
 #define PAYLOAD (512 * 1024)
+#define RXP (256 * 1024)   /* RX message size (1.07 ms) */
+static int rx_fb = 8, tx_fb = 8; static size_t rxp = 256 * 1024, txp = 512 * 1024;   /* frame bytes (4 per enabled channel pair) and message sizes, set per stream from the channel mask */
 static double run_secs_g;
 static char dir[256];
 
@@ -139,7 +141,7 @@ static int submit(int is_tx, int slot)
 {
 	volatile uint32_t *d = is_tx ? ddma : adma;
 	if (d[REG_START_TRANSFER / 4]) return -1;
-	if (!is_tx) { uint64_t *sp = (uint64_t *)(rx_ring + (size_t)slot * slot_bytes + slot_bytes - 64); for (int i = 0; i < 8; i++) sp[i] = SENT; civac(sp, 64); }
+	if (!is_tx) for (size_t j = 1; j <= slot_bytes / rxp; j++) { uint64_t *sp = (uint64_t *)(rx_ring + (size_t)slot * slot_bytes + j * rxp - 64); for (int i = 0; i < 8; i++) sp[i] = SENT; civac(sp, 64); }
 	d[(is_tx ? REG_SRC_ADDRESS : REG_DEST_ADDRESS) / 4] = (uint32_t)((is_tx ? tx_phys : rx_phys) + (uint64_t)slot * slot_bytes);
 	d[REG_X_LENGTH / 4] = slot_bytes - 1; d[REG_Y_LENGTH / 4] = 0; d[REG_FLAGS / 4] = 2;      // FLAG_LAST
 	d[REG_START_TRANSFER / 4] = 1;
@@ -150,32 +152,32 @@ static volatile uint64_t rx_start_ts; static volatile int rx_timed_req;
 static void *rx_thread(void *a)
 {
 	rt_prio(60);
-	char done[64] = {0}; uint64_t nsub = 0, nsend = 0, seq = 0; uint32_t flags = 0; double t0 = now();
+	uint64_t nsub = 0, nsend = 0, seq = 0, cs = 0; uint32_t flags = 0; double t0 = now();
+	const uint64_t nch = slot_bytes / rxp;
 	a9361[0x88 / 4] = 4;                                          // clear sticky ADC overflow
 	if (tm) { tcmd(3, 0, 0); tcmd(4, 0, 1); tcmd(2, rx_timed_req ? rx_start_ts : 0, 0); }   // gate: timed start (0 = now)
 	adma[REG_CTRL / 4] = 1; uint64_t t0ts = 0; int t0ok = 0;
 	while (rx_run) {
-		while (nsub - nsend < (uint64_t)nslots) { if (submit(0, nsub % nslots) < 0) break; done[nsub % nslots] = 0; nsub++; }
-		for (uint64_t k = nsend; k < nsub; k++) {                 // completion = sentinel overwritten by the DMA
-			int s = k % nslots; if (done[s]) continue;
-			uint64_t *sp = (uint64_t *)(rx_ring + (size_t)s * slot_bytes + slot_bytes - 64); civac(sp, 64);
-			if (sp[0] != SENT || sp[7] != SENT) done[s] = 1;
-		}
-		if (nsub > nsend && done[nsend % nslots]) {
-			int s = nsend % nslots; char *base = rx_ring + (size_t)s * slot_bytes;
-			civac(base, slot_bytes);
-			if (tm && !t0ok) { t0ts = rx_first_ts(); t0ok = 1; }
-			uint32_t o = a9361[0x88 / 4];
-			if (o & 4) { a9361[0x88 / 4] = 4; if (nsend > 0) { st.rx_hwovf++; flags |= HF_HWOVF; } if (nsend > 0 && st.rx_hwovf <= 20) printf("HWOVF slot=%llu first_seq=%llu t=%.3f\n", (unsigned long long)nsend, (unsigned long long)seq, now() - t0); }
-			for (size_t off = 0; off < slot_bytes; off += PAYLOAD) {
-				uint64_t sq = seq++; struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = sq, .payload_len = PAYLOAD, .flags = flags, .chunk = t0ts + sq * (uint64_t)(PAYLOAD / 8), .slot_off = (uint32_t)off };
+		while (nsub - nsend < (uint64_t)nslots) { if (submit(0, nsub % nslots) < 0) break; nsub++; }
+		if (cs < nsub * nch) {                                    // next message: complete once the DMA overwrote its sentinel
+			uint64_t s = (cs / nch) % (uint64_t)nslots; size_t j = cs % nch;
+			char *base = rx_ring + (size_t)s * slot_bytes + j * rxp;
+			uint64_t *sp = (uint64_t *)(base + rxp - 64); civac(sp, 64);
+			if (sp[0] != SENT || sp[7] != SENT) {
+				civac(base, rxp);
+				if (tm && !t0ok) { t0ts = rx_first_ts(); t0ok = 1; }
+				uint32_t o = a9361[0x88 / 4];
+				if (o & 4) { a9361[0x88 / 4] = 4; if (cs > 0) { st.rx_hwovf++; flags |= HF_HWOVF; } if (cs > 0 && st.rx_hwovf <= 20) printf("HWOVF msg=%llu t=%.3f\n", (unsigned long long)cs, now() - t0); }
+				uint64_t sq = seq++; struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = sq, .payload_len = rxp, .flags = flags, .chunk = t0ts + sq * (uint64_t)(rxp / rx_fb), .slot_off = (uint32_t)(j * rxp) };
 				flags = 0;
-				struct iovec iov[2] = { { &h, sizeof h }, { base + off, PAYLOAD } };
+				struct iovec iov[2] = { { &h, sizeof h }, { base, rxp } };
 				if (writev(ep_in, iov, 2) < 0) { perror("writev ep1"); goto out; }
-				st.rx_msgs++;
+				st.rx_msgs++; cs++;
+				if (cs % nch == 0) { nsend++; st.rx_slots++; }
+				continue;
 			}
-			nsend++; st.rx_slots++;
-		} else usleep(50);
+		}
+		usleep(50);
 	}
 	{ struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = seq, .payload_len = 0, .flags = HF_END }; write(ep_in, &h, sizeof h); }
 out:
@@ -188,7 +190,12 @@ out:
 #define TX_MAX_MSGS_PER_XFER 8
 #define MAGIC 0x31303550
 static int tx_ring_msgs;
-struct txmeta { uint64_t start; uint32_t bytes; uint32_t timed; };
+struct txmeta { uint64_t start; uint32_t bytes; uint32_t timed; uint64_t t_rd; };
+// TX latency histograms (ticks = 1/30.72 MHz). lead_* : 0.5 ms bins from -4 ms; lat/gap : 0.25 ms bins from 0.
+#define HB 32
+static uint64_t h_lead_rd[HB], h_lead_wr[HB], h_lat[HB], h_gap[HB], h_n_neg_wr, h_n_neg_rd;
+static void hist_add(uint64_t *h, int64_t v, int64_t lo, int64_t bin) { int64_t b = (v - lo) / bin; if (v < lo) b = 0; if (b < 0) b = 0; if (b >= HB) b = HB - 1; h[b]++; }
+static void hist_print(const char *nm, uint64_t *h, double lo_ms, double bin_ms) { printf("hist %s (lo %.2f ms, bin %.2f ms):", nm, lo_ms, bin_ms); for (int i = 0; i < HB; i++) printf(" %llu", (unsigned long long)h[i]); printf("\n"); }
 static int dbg_d, dbg_r; static int dbg_on;
 static struct txmeta *tx_meta; static uint64_t tx_next_ts;
 static volatile uint64_t tx_released_v; static volatile double tx_last_fill;
@@ -200,24 +207,25 @@ static void *tx_reader(void *a)
 	while (tx_run) {
 		while (tx_run && filled >= tx_released_v + (uint64_t)tx_ring_msgs) usleep(100);        // ring full
 		if (!tx_run) break;
-		char *base = tx_ring + (size_t)(filled % tx_ring_msgs) * PAYLOAD;
-		struct hdr h; struct iovec iov[2] = { { &h, sizeof h }, { base, PAYLOAD } };
+		char *base = tx_ring + (size_t)(filled % tx_ring_msgs) * txp;
+		struct hdr h; struct iovec iov[2] = { { &h, sizeof h }, { base, txp } };
 		ssize_t n = readv(ep_out, iov, 2);
 		if (n < 0) { if (errno == EINTR) continue; perror("readv ep2"); break; }
 		if (n >= (ssize_t)sizeof h && h.magic == MAGIC && (h.flags & HF_END)) break;
 		if (n < (ssize_t)sizeof h || h.magic != MAGIC) { st.tx_bad++; continue; }
 		struct txmeta *tmeta = &tx_meta[filled % tx_ring_msgs];
+		uint64_t t_rd = ts_now(); { static uint64_t prev_rd; if (prev_rd && t_rd > prev_rd) hist_add(h_gap, (int64_t)(t_rd - prev_rd), 0, 7680); prev_rd = t_rd; }
 		{ if (dbg_on && dbg_r < 10) { dbg_r++; printf("rd filled=%llu seq=%llu chunk=%llu flags=%x n=%zd\n", (unsigned long long)filled, (unsigned long long)h.seq, (unsigned long long)h.chunk, h.flags, n); fflush(stdout); } }
 		if (h.flags & HF_TX_TIMED) {
 			uint32_t bytes = (uint32_t)(n - sizeof h);
-			if (!bytes || bytes > PAYLOAD || (bytes & 7) || bytes != h.payload_len) { st.tx_bad++; continue; }
-			if (bytes & 15) { memset(base + bytes, 0, 8); bytes += 8; }            // DMA length multiple of 16: pad one zero frame
-			tmeta->start = h.chunk; tmeta->bytes = bytes; tmeta->timed = 1;
+			if (!bytes || bytes > txp || (bytes % tx_fb) || bytes != h.payload_len) { st.tx_bad++; continue; }
+			if (bytes & 15) { uint32_t pad = 16 - (bytes & 15); memset(base + bytes, 0, pad); bytes += pad; }            // DMA length multiple of 16: pad one zero frame
+			tmeta->start = h.chunk; tmeta->bytes = bytes; tmeta->timed = 1; tmeta->t_rd = t_rd;
 			civac(base, bytes);
 		} else {
-			if (n != (ssize_t)(sizeof h + PAYLOAD)) { st.tx_bad++; continue; }
-			tmeta->start = 0; tmeta->bytes = PAYLOAD; tmeta->timed = 0;
-			civac(base, PAYLOAD);
+			if (n != (ssize_t)(sizeof h + txp)) { st.tx_bad++; continue; }
+			tmeta->start = 0; tmeta->bytes = txp; tmeta->timed = 0;
+			civac(base, txp);
 		}
 		__sync_synchronize();
 		filled++; tx_filled_v = filled; st.tx_filled = filled; st.tx_msgs++; tx_last_fill = now();
@@ -228,7 +236,7 @@ static void *tx_reader(void *a)
 static int submit_tx(uint64_t msg, uint64_t bytes)
 {
 	if (ddma[REG_START_TRANSFER / 4]) return -1;
-	ddma[REG_SRC_ADDRESS / 4] = (uint32_t)(tx_phys + msg * PAYLOAD);
+	ddma[REG_SRC_ADDRESS / 4] = (uint32_t)(tx_phys + msg * txp);
 	ddma[REG_X_LENGTH / 4] = bytes - 1; ddma[REG_Y_LENGTH / 4] = 0; ddma[REG_FLAGS / 4] = 2;
 	ddma[REG_START_TRANSFER / 4] = 1;
 	return 0;
@@ -248,21 +256,22 @@ static void *tx_submitter(void *a)
 			if (f > sub && !ddma[REG_START_TRANSFER / 4]) {
 				uint64_t room = tx_ring_msgs - (sub % tx_ring_msgs);
 				struct txmeta m = tx_meta[sub % tx_ring_msgs];
-				uint64_t n = 1, bytes = m.bytes, nexts = m.start + m.bytes / 8;
+				uint64_t n = 1, bytes = m.bytes, nexts = m.start + m.bytes / tx_fb;
 				if (!m.timed) {                                       // untimed data in timed mode: continue the previous burst, else start shortly from now
 					uint64_t t = ts_now();
 					m.start = (tx_next_ts >= t + 2000) ? tx_next_ts : t + 92160;
-					nexts = m.start + m.bytes / 8;
+					nexts = m.start + m.bytes / tx_fb;
 				}
 				uint64_t first_start = m.start;
-				while (n < TX_MAX_MSGS_PER_XFER && n < room && f > sub + n && bytes == (uint64_t)n * PAYLOAD) {
+				while (n < TX_MAX_MSGS_PER_XFER && n < room && f > sub + n && bytes == (uint64_t)n * txp) {
 					struct txmeta m2 = tx_meta[(sub + n) % tx_ring_msgs];
 					if (m2.timed != m.timed || (m2.timed && m2.start != nexts)) break;
-					bytes += m2.bytes; nexts += m2.bytes / 8; n++;
+					bytes += m2.bytes; nexts += m2.bytes / tx_fb; n++;
 				}
-				tx_next_ts = first_start + bytes / 8;
-				tcmd(6, first_start, bytes / 8);
-				{ if (dbg_on && (dbg_d < 8 || (dbg_d % 64) == 0)) { printf("desc#%d msgs=%llu start=%llu frames=%llu now=%llu timed=%u\n", dbg_d, (unsigned long long)n, (unsigned long long)first_start, (unsigned long long)(bytes / 8), (unsigned long long)ts_now(), m.timed); fflush(stdout); } dbg_d++; }
+				tx_next_ts = first_start + bytes / tx_fb;
+				{ uint64_t tw = ts_now(); if (m.timed) { int64_t lr = (int64_t)first_start - (int64_t)m.t_rd, lw = (int64_t)first_start - (int64_t)tw; hist_add(h_lead_rd, lr, -61440, 15360); hist_add(h_lead_wr, lw, -61440, 15360); hist_add(h_lat, (int64_t)(tw - m.t_rd), 0, 7680); if (lr < 0) h_n_neg_rd++; if (lw < 0) h_n_neg_wr++; } }
+tcmd(6, first_start, bytes / tx_fb);
+				{ if (dbg_on && (dbg_d < 8 || (dbg_d % 64) == 0)) { printf("desc#%d msgs=%llu start=%llu frames=%llu now=%llu timed=%u\n", dbg_d, (unsigned long long)n, (unsigned long long)first_start, (unsigned long long)(bytes / tx_fb), (unsigned long long)ts_now(), m.timed); fflush(stdout); } dbg_d++; }
 				if (submit_tx(sub % tx_ring_msgs, bytes) == 0) {
 					sub += n; xfers++; ends[xfers % 8] = sub; tx_submitted_v = sub; st.tx_submitted = sub;
 					if (xfers >= 4) tx_released_v = ends[(xfers - 4) % 8];
@@ -279,7 +288,7 @@ static void *tx_submitter(void *a)
 		if (f > sub) {
 			uint64_t n = f - sub, room = tx_ring_msgs - (sub % tx_ring_msgs);
 			if (n > room) n = room; if (n > TX_MAX_MSGS_PER_XFER) n = TX_MAX_MSGS_PER_XFER;
-			if (submit_tx(sub % tx_ring_msgs, n * PAYLOAD) == 0) {
+			if (submit_tx(sub % tx_ring_msgs, n * txp) == 0) {
 				sub += n; xfers++; ends[xfers % 8] = sub; tx_submitted_v = sub; st.tx_submitted = sub;
 				if (xfers >= 4) tx_released_v = ends[(xfers - 4) % 8];        // transfers older than the 4-deep queue are done
 			} else usleep(50);
@@ -288,6 +297,7 @@ static void *tx_submitter(void *a)
 	}
 	ddma[REG_CTRL / 4] = 0; tcmd(5, 0, 0);
 	tx_submitted_v = 0; tx_filled_v = 0; tx_released_v = 0;
+	hist_print("lead_at_read", h_lead_rd, -4.0, 0.5); hist_print("lead_at_desc_write", h_lead_wr, -4.0, 0.5); hist_print("read_to_desc_write_latency", h_lat, 0.0, 0.25); hist_print("readv_interarrival", h_gap, 0.0, 0.25); printf("neg_lead_at_read %llu neg_lead_at_write %llu\n", (unsigned long long)h_n_neg_rd, (unsigned long long)h_n_neg_wr);
 	printf("tx stopped: pl_done %u pl_late %u pl_unf %u st=%08x msgs",tm?tm[0x2C/4]:0,tm?tm[0x30/4]:0,tm?tm[0x34/4]:0,tm?tm[6]:0); printf(" %llu",0ULL); printf("|msgs %llu submitted %llu unf %llu bad %llu\n", (unsigned long long)st.tx_msgs, (unsigned long long)st.tx_submitted, (unsigned long long)st.tx_unf, (unsigned long long)st.tx_bad); fflush(stdout);
 	__atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
 }
@@ -298,8 +308,30 @@ static void start_rx(void) { pthread_t t; if (rx_alive || ep_in < 0) return; rx_
 static void start_tx(void)
 {
 	pthread_t t1, t2; if (tx_alive || ep_out < 0) return;
-	memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = tx_released_v = 0; tx_last_fill = now(); tx_next_ts = 0; dbg_d = 0; dbg_r = 0; tcmd(5, 0, tx_timed_mode ? 1 : 0);
+	tx_ring_msgs = tx_nslots * (int)(slot_bytes / txp);
+	memset(h_lead_rd, 0, sizeof h_lead_rd); memset(h_lead_wr, 0, sizeof h_lead_wr); memset(h_lat, 0, sizeof h_lat); memset(h_gap, 0, sizeof h_gap); h_n_neg_rd = h_n_neg_wr = 0; memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = tx_released_v = 0; tx_last_fill = now(); tx_next_ts = 0; dbg_d = 0; dbg_r = 0; tcmd(5, 0, tx_timed_mode ? 1 : 0);
 	tx_alive = 2; tx_run = 1; pthread_create(&t1, NULL, tx_reader, NULL); pthread_detach(t1); pthread_create(&t2, NULL, tx_submitter, NULL); pthread_detach(t2);
+}
+
+// One channel pair per bit (bit0 = RX1/TX1, bit1 = RX2/TX2). The PL packers (util_cpack2 / util_upack2) pack only the
+// enabled channels, so a single pair halves the frame size: 4 bytes instead of 8.
+static void set_rx_mask(int mask)
+{
+	if (!(mask & 3)) mask = 3;
+	for (int ch = 0; ch < 4; ch++) {
+		uint32_t v = a9361[(0x400 + ch * 0x40) / 4];
+		v = ((mask >> (ch / 2)) & 1) ? (v | 1u) : (v & ~1u);
+		a9361[(0x400 + ch * 0x40) / 4] = v;
+	}
+	rx_fb = 4 * __builtin_popcount(mask & 3); rxp = (size_t)256 * 1024 * rx_fb / 8;
+	printf("rx mask %d: frame %d B, message %zu B\n", mask & 3, rx_fb, rxp); fflush(stdout);
+}
+static void set_tx_mask(int mask)
+{
+	if (!(mask & 3)) mask = 3;
+	for (int ch = 0; ch < 4; ch++) a9361[(0x4418 + ch * 0x40) / 4] = ((mask >> (ch / 2)) & 1) ? 2 : 3;   // DATA_SEL: 2 = DMA, 3 = zero
+	tx_fb = 4 * __builtin_popcount(mask & 3); txp = tx_fb == 8 ? (size_t)512 * 1024 : (size_t)128 * 1024;
+	printf("tx mask %d: frame %d B, message %zu B\n", mask & 3, tx_fb, txp); fflush(stdout);
 }
 
 int main(int argc, char **argv)
@@ -308,16 +340,16 @@ int main(int argc, char **argv)
 	if (argc < 11) { fprintf(stderr, "usage: %s ffsdir rx_ring_phys slot_bytes nslots adc_dma_phys secs ad9361_phys tx_ring_phys dac_dma_phys tx_nslots\n", argv[0]); return 1; }
 	snprintf(dir, sizeof dir, "%s", argv[1]); rx_phys = strtoull(argv[2], 0, 0); slot_bytes = strtoull(argv[3], 0, 0); nslots = atoi(argv[4]);
 	uint64_t adc_dma = strtoull(argv[5], 0, 0); run_secs_g = atof(argv[6]); uint64_t a9361_phys = strtoull(argv[7], 0, 0);
-	tx_phys = strtoull(argv[8], 0, 0); uint64_t dac_dma = strtoull(argv[9], 0, 0); tx_nslots = atoi(argv[10]); uint64_t tm_phys = argc > 11 ? strtoull(argv[11], 0, 0) : 0; tx_ring_msgs = tx_nslots * (int)(slot_bytes / PAYLOAD);
+	tx_phys = strtoull(argv[8], 0, 0); uint64_t dac_dma = strtoull(argv[9], 0, 0); tx_nslots = atoi(argv[10]); uint64_t tm_phys = argc > 11 ? strtoull(argv[11], 0, 0) : 0; tx_ring_msgs = tx_nslots * (int)(slot_bytes / txp);
 	int mfd = open("/dev/mem", O_RDWR | O_SYNC); if (mfd < 0) { perror("/dev/mem"); return 1; }
 	adma = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, adc_dma); ddma = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, dac_dma);
 	a9361 = mmap(0, 0x8000, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, a9361_phys);
-	if (tm_phys) { tm = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, tm_phys); if (tm == MAP_FAILED) { perror("mmap time"); tm = NULL; } else printf("p501_time id %08x\n", tm[0]); }
+	if (tm_phys) { tm = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, tm_phys); if (tm == MAP_FAILED) { perror("mmap time"); tm = NULL; } else { printf("p501_time id %08x\n", tm[0]); { const char *lt = getenv("P501_LATE_TOL"); uint32_t tol = lt ? (uint32_t)strtoul(lt, NULL, 0) : 30720; tm[0x38 / 4] = tol; printf("late_tol %u ticks\n", tol); } } }   /* PL late tolerance: the PL default of 64 ticks (2 us) discards whole bursts after a tiny DMA starvation */
 	if (adma == MAP_FAILED || ddma == MAP_FAILED || a9361 == MAP_FAILED) { perror("mmap regs"); return 1; }
 	int cfd = open("/dev/mem", O_RDWR);                           // cached mappings of the CMA rings
 	rx_ring = mmap(0, (size_t)nslots * slot_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, rx_phys);
 	tx_ring = mmap(0, (size_t)tx_nslots * slot_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, tx_phys);
-	tx_meta = calloc(tx_ring_msgs, sizeof *tx_meta);
+	tx_meta = calloc((size_t)tx_nslots * (slot_bytes / (128 * 1024)), sizeof *tx_meta);
 	if (rx_ring == MAP_FAILED || tx_ring == MAP_FAILED) { perror("mmap ring"); return 1; }
 	char p[256]; snprintf(p, sizeof p, "%s/ep0", dir);
 	int ep0 = open(p, O_RDWR); if (ep0 < 0) { perror("open ep0"); return 1; }
@@ -337,10 +369,10 @@ int main(int argc, char **argv)
 				uint64_t arg = 0; int wl = ev.u.setup.wLength;
 				if (wl > 0) { char db[16] = {0}; ssize_t rn = read(ep0, db, wl < 16 ? wl : 16); if (rn >= 8) memcpy(&arg, db, 8); }
 				switch (req) {
-				case REQ_RX_START: rx_timed_req = 0; start_rx(); break;
-				case REQ_RX_START_AT: rx_start_ts = arg; rx_timed_req = 1; start_rx(); break;
+				case REQ_RX_START: rx_timed_req = 0; if (!rx_alive) set_rx_mask(ev.u.setup.wValue & 3); start_rx(); break;
+				case REQ_RX_START_AT: rx_start_ts = arg; rx_timed_req = 1; if (!rx_alive) set_rx_mask(ev.u.setup.wValue & 3); start_rx(); break;
 				case REQ_RX_STOP: rx_run = 0; break;
-				case REQ_TX_START: tx_timed_mode = tm ? (ev.u.setup.wValue & 1) : 0; start_tx(); break;
+				case REQ_TX_START: tx_timed_mode = tm ? (ev.u.setup.wValue & 1) : 0; if (!tx_alive) set_tx_mask((ev.u.setup.wValue >> 4) & 3); start_tx(); break;
 				case REQ_TX_STOP: tx_run = 0; break;
 				case REQ_TIME_SET: printf("TIME_SET %llu (was %llu)\n", (unsigned long long)arg, (unsigned long long)ts_now()); fflush(stdout); tcmd(1, arg, 0); printf("  now %llu\n", (unsigned long long)ts_now()); fflush(stdout); break; }
 				if (wl == 0 && read(ep0, p, 0) < 0) perror("ep0 ack");

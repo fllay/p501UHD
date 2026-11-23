@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 module tb;
+  integer errors = 0;
   reg aclk = 0, aresetn = 0, clk = 0, resetn = 0;
   always #5 aclk = ~aclk;
   always #16.25 clk = ~clk;
@@ -31,15 +32,28 @@ module tb;
 
   // upack model: data counter advances per pull, valid one cycle later (as util_upack2)
   reg [15:0] cnt = 1;
+  reg all_avail = 1; integer avail = 0; reg feed1 = 0;
+  wire ok = all_avail | (avail > 0);
   always @(posedge clk) begin
-    upv <= tx_pull; if (tx_pull) begin up0 <= cnt; up1 <= cnt; up2 <= cnt; up3 <= cnt; cnt <= cnt + 1; end
+    upv <= tx_pull & ok; if (tx_pull & ok) begin up0 <= cnt; up1 <= cnt; up2 <= cnt; up3 <= cnt; cnt <= cnt + 1; end
+    if (!all_avail) avail <= avail - ((tx_pull & ok) ? 1 : 0) + (feed1 ? 1 : 0);
+  end
+  task feed(input integer n, input integer gap); integer k; begin
+    for (k = 0; k < n; k = k + 1) begin @(posedge clk); feed1 <= 1; @(posedge clk); feed1 <= 0; repeat (gap) @(posedge clk); end end endtask
+  // starvation check: emitted data must be a gapless counter
+  reg check_on = 0; reg [15:0] expect_v = 0; integer nchk = 0;
+  always @(posedge clk) if (check_on && txov && txo0 != 0) begin
+    if (txo0 !== expect_v) begin errors = errors + 1; $display("SLIP: got %0d expect %0d", txo0, expect_v); expect_v <= txo0 + 1; end
+    else expect_v <= expect_v + 1;
+    nchk <= nchk + 1;
   end
   // request pattern: 8 on / 0 off continuous (test 1), later bursty
   integer mode = 0; integer ph = 0;
   always @(posedge clk) begin ph <= ph + 1; tx_req <= (mode == 0) ? 1'b1 : ((ph % 12) < 8); end
 
+  always @(posedge clk) if (dut.start) $display("START ts=%0d head_ts=%0d len=%0d late=%0d pend_eff=%0d disc=%0d", dut.ts, dut.head_ts, dut.head_len, dut.is_late, dut.pend_eff, dut.discard);
   // monitor
-  integer nout = 0; reg [63:0] tsnow; integer errors = 0;
+  integer nout = 0; reg [63:0] tsnow;
   always @(posedge clk) if (resetn && txov) begin nout <= nout + 1; end
   integer f; initial f = $fopen("tx_out.txt", "w");
   always @(posedge clk) if (resetn && txov) $fwrite(f, "%0d %0d %0d\n", dut.ts, txo0, txunf);
@@ -69,6 +83,28 @@ module tb;
     cmd(4'd6, {v2, v} + 64'd2000, 50); cmd(4'd6, {v2, v} + 64'd2050, 50);
     #200000;
     axi_r(8'h2c, v); $display("tx_done=%0d (expect 5)", v); if (v != 5) errors = errors + 1;
+    // ---- starvation: the data arrives late and in dribbles; frames must never slip, late burst data must be consumed
+    all_avail = 0; avail = 0; mode = 0;
+    begin : starve
+      reg [15:0] base; reg [63:0] t0;
+      base = cnt; expect_v = base + 20; 
+      axi_r(8'h1c, v); axi_r(8'h20, v2); t0 = {v2, v};
+      cmd(4'd6, 64'd5, 20);              // late: 20 frames to be consumed and dropped
+      cmd(4'd6, t0 + 64'd1500, 40);
+      cmd(4'd6, t0 + 64'd4000, 40);
+      cmd(4'd6, t0 + 64'd7000, 25);
+      check_on = 1;
+      repeat (300) @(posedge clk); feed(20, 1);
+      repeat (1500) @(posedge clk); feed(25, 3);      // window A is already open and starved
+      repeat (400) @(posedge clk); feed(35, 2);
+      repeat (2500) @(posedge clk); feed(20, 3);      // window B open and starved
+      repeat (300) @(posedge clk); feed(25, 1);
+      repeat (6000) @(posedge clk);
+      check_on = 0;
+      $display("starve: avail=%0d pend=%0d consumed=%0d (expect 125) emitted=%0d (expect 105) unf=%0d", avail, dut.pend, cnt - base, nchk, dut.tx_unf);
+      if (avail != 0 || dut.pend != 0 || (cnt - base) != 125 || nchk != 105) errors = errors + 1;
+    end
+    all_avail = 1;
     // ---- RX gate
     cmd(4'd4, 0, 3);                 // timed + tag
     axi_r(8'h1c, v); axi_r(8'h20, v2);

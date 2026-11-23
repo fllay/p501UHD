@@ -47,6 +47,14 @@ static const uint16_t USB_VID = 0x1209, USB_PID = 0x0002;
 static const char* DEFAULT_ADDR = "192.168.2.1";
 static const int DEFAULT_PORT   = 5555;
 static const double FS          = 30.72e6;
+// TX timestamp advance (samples): lets the gNB use stock time_alignment_calibration (<0) to gain RX->TX processing delay;
+// the driver removes the same shift before transmitting. Set with device_args tx_advance_samples=N.
+static long long g_tx_adv = 0;
+// Radio channels used by a streamer (bit0 = RX1/TX1, bit1 = RX2/TX2): the PL packs only those, 4 bytes per channel pair.
+// P501_ALLCH=1 forces both (8-byte frames).
+static int rch_mask(const std::vector<size_t>& r) { int m = 0; for (auto c : r) m |= 1 << c; return getenv("P501_ALLCH") ? 3 : m; }
+static int rch_lane(int mask, size_t radio_ch) { return __builtin_popcount(mask & ((1 << radio_ch) - 1)); }
+static long long toff() { static long long v = getenv("P501_TIME_OFFSET") ? atoll(getenv("P501_TIME_OFFSET")) : 0; return v; } // gNB timeline = hardware time + toff() ticks
 static const size_t FRAMES      = 65536;                 // frames per USB message
 static const size_t PAYLOAD     = FRAMES * 8;            // 512 KiB
 static const uint32_t MAGIC     = 0x31303550;
@@ -223,10 +231,10 @@ public:
         if (r < 0)
             throw uhd::io_error(std::string("p501: USB control request failed: ") + libusb_error_name(r));
     }
-    void ctl_out64(int req, uint64_t v)
+    void ctl_out64(int req, uint64_t v, int wvalue = 0)
     {
         std::lock_guard<std::mutex> l(_cm);
-        int r = libusb_control_transfer(_h, 0x41, req, 0, _ifn, (unsigned char*)&v, 8, 2000);
+        int r = libusb_control_transfer(_h, 0x41, req, wvalue, _ifn, (unsigned char*)&v, 8, 2000);
         if (r < 0)
             throw uhd::io_error(std::string("p501: USB control request failed: ") + libusb_error_name(r));
     }
@@ -275,8 +283,28 @@ struct shared_t {
     std::vector<size_t> rx_map{0, 1}, tx_map{0, 1};
     std::atomic<double> time_offset{0.0};
     bool hw_time = false;
-    uint64_t ticks_now() { return get_usb().ctl_in64(REQ_TIME_GET); }
-    void set_ticks(uint64_t t) { get_usb().ctl_out64(REQ_TIME_SET, t); }
+    // Control transfers while the bulk pipes stream are kept rare (a burst of them can wedge the USB3 IN pipe on some
+    // hosts): the PL time is read at most every 100 ms and extrapolated in between with the host clock.
+    std::mutex tm;
+    double tm_host = -1.0;
+    uint64_t tm_ticks = 0;
+    uint64_t ticks_now()
+    {
+        std::lock_guard<std::mutex> l(tm);
+        const double h = steady_s();
+        if (tm_host < 0.0 || h - tm_host > 0.1 || h < tm_host) {
+            tm_ticks = get_usb().ctl_in64(REQ_TIME_GET);
+            tm_host  = h;
+            return tm_ticks;
+        }
+        return tm_ticks + (uint64_t)((h - tm_host) * FS);
+    }
+    void set_ticks(uint64_t t)
+    {
+        std::lock_guard<std::mutex> l(tm);
+        get_usb().ctl_out64(REQ_TIME_SET, t);
+        tm_host = -1.0;
+    }
     time_spec_t now()
     {
         if (hw_time)
@@ -290,8 +318,10 @@ struct shared_t {
 // ---------------------------------------------------------------------------
 class rx_streamer_impl : public uhd::rx_streamer
 {
+    static constexpr size_t MAXQ = 4;
+    int _dbgt = 0, _dbgl = 0; uint64_t _dbgc = 0;
 public:
-    static constexpr int NX = 16;
+    static constexpr int NX = 32;
     static constexpr size_t XSZ = 1024 * 1024;
 
     rx_streamer_impl(std::shared_ptr<shared_t> sh, const stream_args_t& a) : _sh(sh)
@@ -305,6 +335,10 @@ public:
                 throw uhd::value_error("p501: RX channel out of range");
             c = _sh->rx_map[c];
         }
+        for (auto c : _chans)
+            _rch.push_back(getenv("P501_RX_SWAP") ? 1 - c : c);
+        _mask = rch_mask(_rch);
+        _fb   = 4 * __builtin_popcount(_mask);
         usb_t& u = _sh->get_usb();
         for (int i = 0; i < NX; i++) {
             libusb_transfer* t = libusb_alloc_transfer(0);
@@ -343,7 +377,7 @@ public:
     {
         std::lock_guard<std::mutex> l(_cmd_m);
         bool timed = !cmd.stream_now && _sh->hw_time;
-        long long start = timed ? cmd.time_spec.to_ticks(FS) : 0;
+        long long start = timed ? cmd.time_spec.to_ticks(FS) - toff() : 0;
         if (!cmd.stream_now && !_sh->hw_time && !_warned) {
             _warned = true;
             LOGW("timed stream commands are not supported (no hardware time): streaming starts now");
@@ -379,6 +413,7 @@ public:
         while (done < nsamps) {
             if (!_cur) {
                 if (!next_msg(std::max(0.0, tend - steady_s()))) {
+                    if (getenv("P501_DEBUG") && _dbgt++ < 20) { size_t q; { std::lock_guard<std::mutex> l(_m); q = _q.size(); } fprintf(stderr, "RXTIMEOUT q=%zu outstanding=%d consumed=%llu fails=%d active=%d\n", q, (int)_outstanding, (unsigned long long)_dbgc, (int)_fails, (int)_active); }
                     if (done == 0)
                         md.error_code = rx_metadata_t::ERROR_CODE_TIMEOUT;
                     break;
@@ -388,7 +423,7 @@ public:
                         _ovf_pending = false;
                         md.error_code = rx_metadata_t::ERROR_CODE_OVERFLOW;
                         md.has_time_spec = true;
-                        md.time_spec = _sh->now();
+                        md.time_spec = _sh->now() + time_spec_t::from_ticks(toff(), FS);
                         return 0;
                     }
                     break; // deliver what we have; the overflow is reported by the next call
@@ -397,7 +432,7 @@ public:
             if (done == 0) {
                 md.has_time_spec = true;
                 if (_sh->hw_time)
-                    md.time_spec = time_spec_t::from_ticks((long long)(_msg_ts + _off), FS);
+                    md.time_spec = time_spec_t::from_ticks((long long)(_msg_ts + _off) + toff(), FS);
                 else
                     md.time_spec = time_spec_t(_t0 + double(_samps_out) / FS);
             }
@@ -480,25 +515,60 @@ private:
             submit(t);
     }
 
+    // The RX ring on the board is a FIFO: a consumer that was late to start stays that far behind real time for good, and a
+    // timed TX (scheduled from RX timestamps) then misses every deadline. Messages older than LAG_MAX are dropped
+    // (reported as one overflow) so the stream is brought back to real time.
+    static long long lag_max() { static long long v = getenv("P501_LAG_MAX") ? atoll(getenv("P501_LAG_MAX")) : 2457600; return v; }
     bool next_msg(double timeout)
+    {
+        const double tend = steady_s() + timeout;
+        for (;;) {
+            if (!next_msg_raw(std::max(0.0, tend - steady_s())))
+                return false;
+            if (!_sh->hw_time)
+                return true;
+            const long long lag = (long long)_sh->now().to_ticks(FS) - (long long)(_msg_ts + _frames);
+            if (getenv("P501_DEBUG_RX")) { static long long mx = 0; static int cnt = 0; if (lag > 122880 && cnt++ < 400) fprintf(stderr, "RXLAG %lld ticks (%.2f ms) seq=%llu\n", lag, lag / 30720.0, (unsigned long long)_next_seq); (void)mx; }
+            if (lag <= lag_max())
+                return true;
+            if (getenv("P501_DEBUG") && _dbgl++ < 10)
+                fprintf(stderr, "RX stale message dropped (lag %lld ticks)\n", lag);
+            _ovf_pending = true;
+            release_msg();
+        }
+    }
+    bool next_msg_raw(double timeout)
     {
         retry_submits();
         std::unique_lock<std::mutex> l(_m);
         if (!_cv.wait_for(l, std::chrono::duration<double>(timeout), [&] { return !_q.empty(); }))
             return false;
+        // keep the RX latency bounded: a consumer that starts late (or stalls) must not stay a fixed backlog behind real time
+        std::vector<libusb_transfer*> stale;
+        while (_q.size() > MAXQ) {
+            stale.push_back(_q.front());
+            _q.pop_front();
+        }
         _cur = _q.front();
         _q.pop_front();
         l.unlock();
+        for (auto* t : stale)
+            submit(t);
+        if (!stale.empty() && getenv("P501_DEBUG"))
+            fprintf(stderr, "RX backlog: dropped %zu stale messages\n", stale.size());
         auto* h = (hdr_t*)_cur->buffer;
+        if (!stale.empty())
+            _ovf_pending = true;
         if (_have_seq && h->seq != _next_seq)
             _ovf_pending = true;
         if (h->flags & (HF_OVR | HF_HWOVF))
             _ovf_pending = true;
+        _dbgc++;
         _have_seq = true;
         _msg_ts   = h->chunk;
         _next_seq = h->seq + 1;
         _off      = 0;
-        _frames   = std::min<size_t>(FRAMES, (_cur->actual_length - sizeof(hdr_t)) / 8);
+        _frames   = std::min<size_t>(FRAMES, (_cur->actual_length - sizeof(hdr_t)) / _fb);
         return true;
     }
     void release_msg()
@@ -511,20 +581,22 @@ private:
 
     void convert(const buffs_type& buffs, size_t dst, size_t n)
     {
-        const int16_t* src = (const int16_t*)(_cur->buffer + sizeof(hdr_t)) + 4 * _off;
+        const size_t st = _fb / 2; // int16 per frame
+        const int16_t* src = (const int16_t*)(_cur->buffer + sizeof(hdr_t)) + st * _off;
+        if (const char* dp = getenv("P501_RXDUMP")) { static FILE* df = fopen(dp, "wb"); static size_t dn = 0; if (df && dn < 6000000) { fwrite(src, _fb, n, df); dn += n; if (dn >= 6000000) fclose(df); } }
         for (size_t c = 0; c < _chans.size(); c++) {
-            const int16_t* s = src + 2 * _chans[c];
+            const int16_t* s = src + 2 * rch_lane(_mask, _rch[c]);
             if (_fc32) {
                 float* d = (float*)buffs[c] + 2 * dst;
                 for (size_t i = 0; i < n; i++) {
-                    d[2 * i]     = float(s[4 * i]) * (1.0f / 2048.0f);
-                    d[2 * i + 1] = float(s[4 * i + 1]) * (1.0f / 2048.0f);
+                    d[2 * i]     = float(s[st * i]) * (1.0f / 2048.0f);
+                    d[2 * i + 1] = float(s[st * i + 1]) * (1.0f / 2048.0f);
                 }
             } else {
                 int16_t* d = (int16_t*)buffs[c] + 2 * dst;
                 for (size_t i = 0; i < n; i++) {
-                    d[2 * i]     = int16_t(s[4 * i] * 16); // the AD9361 port is 12 bit right-justified
-                    d[2 * i + 1] = int16_t(s[4 * i + 1] * 16);
+                    d[2 * i]     = int16_t(s[st * i] * 16); // the AD9361 port is 12 bit right-justified
+                    d[2 * i + 1] = int16_t(s[st * i + 1] * 16);
                 }
             }
         }
@@ -546,10 +618,11 @@ private:
         _remaining = nsamps;
         _stop_when_done = stop_when_done;
         _t0 = _sh->hw_time ? 0.0 : _sh->now().get_real_secs();
+        if (getenv("P501_DEBUG")) fprintf(stderr, "RXSTART timed=%d start=%lld now=%lld nsamps=%zu\n", (int)timed, (long long)start_ticks, 0LL, (size_t)nsamps);
         if (timed)
-            _sh->get_usb().ctl_out64(REQ_RX_START_AT, (uint64_t)start_ticks);
+            _sh->get_usb().ctl_out64(REQ_RX_START_AT, (uint64_t)start_ticks, _mask);
         else
-            _sh->get_usb().ctl(REQ_RX_START);
+            _sh->get_usb().ctl(REQ_RX_START, _mask);
         _active = true;
     }
     void stop_stream()
@@ -587,7 +660,8 @@ private:
 
     std::shared_ptr<shared_t> _sh;
     bool _fc32 = true;
-    std::vector<size_t> _chans;
+    std::vector<size_t> _chans, _rch;
+    int _mask = 3, _fb = 8;
     std::vector<libusb_transfer*> _xfers;
     std::mutex _m, _cmd_m, _stop_m;
     std::condition_variable _cv;
@@ -624,6 +698,12 @@ public:
                 throw uhd::value_error("p501: TX channel out of range");
             c = _sh->tx_map[c];
         }
+        for (auto c : _chans)
+            _rch.push_back(getenv("P501_TX_SWAP") ? 1 - c : c);
+        _mask = rch_mask(_rch);
+        _fb   = 4 * __builtin_popcount(_mask);
+        _txfr = _fb == 8 ? FRAMES : FRAMES / 2; // message = 512 KiB (2 channels) or 128 KiB (1 channel)
+        _pl   = _txfr * _fb;
         usb_t& u = _sh->get_usb();
         for (int i = 0; i < NX; i++) {
             libusb_transfer* t = libusb_alloc_transfer(0);
@@ -641,7 +721,8 @@ public:
     {
         const double tend = steady_s() + timeout;
         for (;;) {
-            if (_started && !_dead) {
+            if (_started && !_dead && steady_s() - _last_poll >= 0.05) {
+                _last_poll = steady_s();
                 uint64_t st[12];
                 if (_sh->get_usb().status(st)) {
                     uint64_t late = st[10], unf = st[5] + st[11];
@@ -649,7 +730,7 @@ public:
                     md.channel = 0;
                     md.has_time_spec = _sh->hw_time;
                     if (_sh->hw_time)
-                        md.time_spec = time_spec_t::from_ticks((long long)st[8], FS);
+                        md.time_spec = time_spec_t::from_ticks((long long)st[8] + toff(), FS);
                     if (late > _seen_late) {
                         _seen_late = late;
                         md.event_code = async_metadata_t::EVENT_CODE_TIME_ERROR;
@@ -709,25 +790,28 @@ public:
             LOGW("timed TX bursts are not supported (no hardware time): samples are played as they arrive");
         }
         if (!_started) {
-            _sh->get_usb().ctl(REQ_TX_START, _sh->hw_time ? 1 : 0);
+            _sh->get_usb().ctl(REQ_TX_START, (_sh->hw_time ? 1 : 0) | (_mask << 4));
             _started = true;
         }
         if (md.has_time_spec && _sh->hw_time) {
             if (_cur && _fill > 0)
                 flush();
             _burst_timed = true;
-            _next_ticks  = (uint64_t)md.time_spec.to_ticks(FS);
+            _next_ticks  = (uint64_t)(md.time_spec.to_ticks(FS) - toff() - g_tx_adv);
+            if (getenv("P501_DEBUG_TX")) fprintf(stderr, "TXL %lld\n", (long long)_next_ticks - (long long)_sh->now().to_ticks(FS)); if (getenv("P501_DEBUG") && (_dbgn++ % 20) == 0) { size_t fr; { std::lock_guard<std::mutex> l(_m); fr = _free.size(); } fprintf(stderr, "TXBURST n=%d start=%llu now=%lld lead=%lld nsamps=%zu eob=%d inflight=%d free=%zu\n", _dbgn, (unsigned long long)_next_ticks, (long long)_sh->now().to_ticks(FS), (long long)_next_ticks - (long long)_sh->now().to_ticks(FS), nsamps, (int)md.end_of_burst, (int)_inflight, fr); }
         }
         const double tend = steady_s() + timeout;
         size_t done = 0;
         while (done < nsamps) {
-            if (!_cur && !acquire(std::max(0.0, tend - steady_s())))
+            if (!_cur && !acquire(std::max(0.0, tend - steady_s()))) {
+                if (getenv("P501_DEBUG") && _dbgs++ < 20) fprintf(stderr, "TXSTALL done=%zu/%zu inflight=%d\n", done, nsamps, (int)_inflight);
                 return done;
-            size_t n = std::min(nsamps - done, FRAMES - _fill);
+            }
+            size_t n = std::min(nsamps - done, _txfr - _fill);
             convert(buffs, done, n);
             done += n;
             _fill += n;
-            if (_fill == FRAMES)
+            if (_fill == _txfr)
                 flush();
         }
         if (md.end_of_burst && _cur && _fill > 0)
@@ -759,8 +843,8 @@ private:
         _cur = _free.front();
         _free.pop_front();
         l.unlock();
-        memset(_cur->buffer + sizeof(hdr_t), 0, PAYLOAD);
-        _cur->length = (int)(sizeof(hdr_t) + PAYLOAD);
+        memset(_cur->buffer + sizeof(hdr_t), 0, _pl);
+        _cur->length = (int)(sizeof(hdr_t) + _pl);
         _fill = 0;
         return true;
     }
@@ -771,13 +855,15 @@ private:
         h->magic       = MAGIC;
         h->hdr_len     = sizeof *h;
         h->seq         = _seq++;
-        h->payload_len = PAYLOAD;
+        h->payload_len = _pl;
         if (_burst_timed) {
-            size_t frames = _fill + (_fill & 1); // even frame count; the buffer tail is zero
+            const size_t q = 16 / _fb; // the board needs a multiple of 16 bytes
+            size_t frames = (_fill + q - 1) / q * q; // the buffer tail is zero
             h->flags       = HF_TX_TIMED;
             h->chunk       = _next_ticks;
-            h->payload_len = (uint32_t)(frames * 8);
-            _cur->length   = (int)(sizeof(hdr_t) + frames * 8);
+            h->payload_len = (uint32_t)(frames * _fb);
+            _cur->length   = (int)(sizeof(hdr_t) + frames * _fb);
+            if (getenv("P501_DEBUG_TX")) fprintf(stderr, "TXF %lld\n", (long long)h->chunk - (long long)_sh->now().to_ticks(FS));
             _next_ticks += frames;
         }
         if (getenv("P501_DEBUG") && h->seq < 12)
@@ -792,6 +878,7 @@ private:
             sr = libusb_submit_transfer(t);
         }
         if (sr) {
+            fprintf(stderr, "p501: TX submit failed (%s), message dropped\n", libusb_error_name(sr));
             _inflight--;
             std::lock_guard<std::mutex> l(_m);
             _free.push_back(t);
@@ -804,20 +891,21 @@ private:
     }
     void convert(const buffs_type& buffs, size_t src, size_t n)
     {
-        int16_t* dst = (int16_t*)(_cur->buffer + sizeof(hdr_t)) + 4 * _fill;
+        const size_t st = _fb / 2; // int16 per frame
+        int16_t* dst = (int16_t*)(_cur->buffer + sizeof(hdr_t)) + st * _fill;
         for (size_t c = 0; c < _chans.size(); c++) {
-            int16_t* d = dst + 2 * _chans[c];
+            int16_t* d = dst + 2 * rch_lane(_mask, _rch[c]);
             if (_fc32) {
                 const float* s = (const float*)buffs[c] + 2 * src;
                 for (size_t i = 0; i < n; i++) {
-                    d[4 * i]     = sat(s[2 * i]);
-                    d[4 * i + 1] = sat(s[2 * i + 1]);
+                    d[st * i]     = sat(s[2 * i]);
+                    d[st * i + 1] = sat(s[2 * i + 1]);
                 }
             } else {
                 const int16_t* s = (const int16_t*)buffs[c] + 2 * src;
                 for (size_t i = 0; i < n; i++) {
-                    d[4 * i]     = s[2 * i];
-                    d[4 * i + 1] = s[2 * i + 1];
+                    d[st * i]     = s[2 * i];
+                    d[st * i + 1] = s[2 * i + 1];
                 }
             }
         }
@@ -825,8 +913,10 @@ private:
 
     std::shared_ptr<shared_t> _sh;
     bool _fc32 = true, _started = false, _warned = false, _burst_timed = false;
-    uint64_t _next_ticks = 0, _seen_late = 0, _seen_unf = 0;
-    std::vector<size_t> _chans;
+    uint64_t _next_ticks = 0, _seen_late = 0, _seen_unf = 0; int _dbgn = 0, _dbgs = 0; double _last_poll = 0.0;
+    std::vector<size_t> _chans, _rch;
+    int _mask = 3, _fb = 8;
+    size_t _txfr = FRAMES, _pl = PAYLOAD;
     std::vector<libusb_transfer*> _xfers;
     std::deque<libusb_transfer*> _free;
     std::mutex _m;
@@ -846,6 +936,7 @@ class p501_device : public uhd::device
 public:
     explicit p501_device(const device_addr_t& args)
     {
+        g_tx_adv = args.has_key("tx_advance_samples") ? std::stoll(args["tx_advance_samples"]) : 0;
         _sh = std::make_shared<shared_t>();
         _sh->ctrl.reset(new ctrl_t(args.get("addr", DEFAULT_ADDR), DEFAULT_PORT, 3.0));
         _info = _sh->ctrl->call("info");
@@ -930,11 +1021,11 @@ void p501_device::_build_tree()
     // time: the host clock (no hardware timekeeper in v1)
     auto set_time = [sh](const time_spec_t& t) {
         if (sh->hw_time)
-            sh->set_ticks((uint64_t)t.to_ticks(FS));
+            sh->set_ticks((uint64_t)(t.to_ticks(FS) - toff()));
         else
             sh->time_offset = t.get_real_secs() - steady_s();
     };
-    _tree->create<time_spec_t>(mb / "time/now").set_publisher([sh] { return sh->now(); }).add_coerced_subscriber(set_time);
+    _tree->create<time_spec_t>(mb / "time/now").set_publisher([sh] { return sh->now() + time_spec_t::from_ticks(toff(), FS); }).add_coerced_subscriber(set_time);
     _tree->create<time_spec_t>(mb / "time/pps")
         .set_publisher([sh] { return time_spec_t(std::floor(sh->now().get_real_secs())); })
         .add_coerced_subscriber(set_time);

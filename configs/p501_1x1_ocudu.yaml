@@ -1,0 +1,66 @@
+cu_cp:
+  amf:
+    addr: 10.53.1.2
+    port: 38412
+    bind_addr: 192.168.68.30
+    supported_tracking_areas:
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+          - plmn: "00102"
+            tai_slice_support_list:
+              - sst: 1
+ru_sdr:
+  device_driver: uhd                                            # The RF driver name.
+  device_args:  type=p501,tx_advance_samples=199680
+  clock: internal                                                       # Specify the clock source used by the RF.
+  sync: internal                                                        # Specify the sync source used by the RF.
+  srate: 30.72                                                  # RF sample rate might need to be adjusted according to selected bandwidth.
+  otw_format: sc12
+  time_alignment_calibration: -199680
+  tx_gain: 69
+  rx_gain: 20                                         #60          # Receive gain of the RF might need to adjusted to the given situation.
+
+cell_cfg:
+  dl_arfcn: 632628                                                # ARFCN of the downlink carrier (center frequency).
+  band: 78                                                        # The NR band.
+  channel_bandwidth_MHz: 20                                       # Bandwith in MHz. Number of PRBs will be automatically derived.
+  common_scs: 30                                                  # Subcarrier spacing in kHz used for data.
+  plmn: "00101"                                                   # PLMN broadcasted by the gNB.
+  additional_plmns:
+    - "00102"
+  tac: 7                                                          # Tracking area code (needs to match the core configuration).
+  pci: 3                                                          # Physical cell ID.
+  nof_antennas_dl: 1
+  nof_antennas_ul: 1
+  ssb:
+    ssb_period: 10
+  prach:
+    ra_resp_window: 80
+  pdsch:
+    mcs_table: qam256
+log:
+  filename: /tmp/gnb.log                                          # Path of the log file.
+  all_level:  warning                                               # Logging level applied to all layers.
+  #phy_rx_symbols_filename: /tmp/iq.log
+
+pcap:
+  mac_type: dlt
+  mac_enable: true                                               # Set to true to enable MAC-layer PCAPs.
+  mac_filename: /tmp/gnb_mac.pcap  #/home/pi/src/fifo/gnb_mac.pcap         #/tmp/gnb_mac.pcap                                 # Path where the MAC PCAP is stored.
+  ngap_enable: true                                              # Set to true to enable NGAP PCAPs.
+  ngap_filename: /tmp/gnb_ngap.pcap #/home/pi/src/fifo/gnb_ngap.pcap                               # Path where the NGAP PCAP is stored.
+
+
+
+#metrics:
+#  autostart_stdout_metrics: true
+#  enable_json: true
+#remote_control:
+#  bind_addr: 0.0.0.0
+#  enabled: true
+
+expert_phy:
+  max_proc_delay: 10

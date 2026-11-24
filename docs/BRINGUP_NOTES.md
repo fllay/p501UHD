@@ -17,10 +17,15 @@ Phones connect to the cell. Things that must be right:
 
 ## gNB (OCUDU) side
 
-* `configs/p501_1x1_ocudu.yaml`: stock options only (`device_args: type=p501,tx_advance_samples=199680`,
-  `time_alignment_calibration: -199680`, `max_proc_delay: 10`, `ra_resp_window: 80`).
-* `ocudu/ocudu_p501.patch`: three small changes still needed because the RX data is about 3.4 ms stale: RAR window limit 40,
-  UL pipeline depth 4 frames, lower-PHY request pool 64. Goal: remove them by cutting the staleness.
+* `configs/p501_1x1_ocudu.yaml` and `examples/ocudu_gnb/`: stock options only, **no OCUDU patch** (`device_args: type=p501,tx_advance_samples=92160`,
+  `time_alignment_calibration: -92160`, `max_proc_delay: 5` (the OCUDU default), `ra_resp_window: 20`).
+  The RAR must be sent within 10 ms (n78 is a licensed band) of the PRACH. The RAR slot is about
+  `1 + PRACH detection + tx advance + max_proc_delay` slots after the PRACH, so the old values (6.5 ms advance, delay 10)
+  needed the window limit lifted from 10 to 40 ms in the validator. A TX advance of 3 ms still leaves the board
+  about 1 ms of lead at the USB write (`P501_DEBUG_TX=1` prints it as `TXF`; the PL tolerates 1 ms late) and the lower PHY
+  meets its DL deadlines with `max_proc_delay` 5 (3 gives "Downlink data late"; 4 ms advance with delay 5 and 6.5 ms advance
+  both miss the RAR window). The 4-frame UL pipeline and the 64-entry request pool of the old patch were not needed.
+  The RX data reaches the gNB 0.55-0.8 ms old (`P501_RXLAGSTAT=1` prints min/avg/max per 2000 messages).
 
 ## Open
 

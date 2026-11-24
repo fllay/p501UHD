@@ -8,21 +8,23 @@ passing traffic, and the config files here are the ones that produced the number
 |---|---|
 | `gnb_p501_1x1_n78_20mhz.yaml` | OCUDU gNB config: band n78, ARFCN 632628 (3489.42 MHz), 20 MHz, 30 kHz SCS, PCI 3, TAC 7, PLMN 00101, 1T1R |
 | `open5gs-5gc.yml` | Open5GS all-in-one core config used with it (AMF 10.53.1.2, GTP-U MTU 1400) |
-| `../../ocudu/ocudu_p501.patch` | local OCUDU changes used for this test (see "OCUDU patches") |
 | `../../tools/run_gnb_p501.sh` | persistent gNB launcher: graceful stop, waits for the USB re-enumeration, `METRICS=1` prints per-UE metrics |
 | `../../tools/core_watchdog.sh` | restarts the Open5GS container (and the gNB) when the AMF dies |
 | `../../tools/board_restart_p501d.sh` | restarts the board daemon (run as root on the board) |
+| `../../tools/full_restart_gnb.sh` | graceful gNB stop, board restart, host IP, gNB start in one go |
 | `../../tools/rx_noise_spectrum.py`, `../../tools/pusch_by_prb.py` | receiver noise capture and PUSCH SINR-by-allocation analysis |
 
-## Result (one phone close to the antenna, RSRP about -87 dBm)
+## Result (stock OCUDU, one phone close to the antenna, RSRP about -87 dBm)
 
 | | Throughput |
 |---|---|
-| Downlink TCP, `iperf3 -c <ue>` | about 27 Mbit/s average, up to 40 Mbit/s (MCS 25-27) |
-| Uplink TCP, `iperf3 -c <ue> -R` | about 11.5-12 Mbit/s steady state, after about 15 s of link-adaptation ramp-up |
-| Ping, core to UE | 20-30 ms |
+| Downlink TCP, `iperf3 -c <ue>` | about 46 Mbit/s steady (MCS 26-27, about 1000-1250 PDSCH TBs/s) |
+| Uplink TCP, `iperf3 -c <ue> -R` | 5-6.5 Mbit/s (MCS 7-9 at 14-17 dB reported SINR) |
 
-Before the fixes below the same setup gave 14.8 Mbit/s downlink and about 1 Mbit/s uplink.
+Notes: with the earlier 6.5 ms advance (and the OCUDU patch) the same setup gave about 27 Mbit/s downlink. The uplink reached
+11.5-12 Mbit/s (MCS 13-14, about 20 dB SINR) in an earlier session; in this session the same phone sat at 14-17 dB and
+both the stock and the patched build gave 5-6.5 Mbit/s, so the difference is the radio conditions or the phone and is not
+caused by dropping the patch. The cause has not been found yet.
 
 ## Topology
 
@@ -49,7 +51,7 @@ interface that carries the IQ stream. The module talks to both.
    ```
    The launcher copies `build/libuhd_p501.so` to a private directory and sets `UHD_MODULE_PATH` to it.
    Raise `usbfs_memory_mb` (`echo 256 > /sys/module/usbcore/parameters/usbfs_memory_mb`) or the module warns.
-3. **OCUDU**: apply `ocudu/ocudu_p501.patch` to commit `bd0d2cd27c` and build the gNB as usual.
+3. **OCUDU**: stock build of commit `bd0d2cd27c`; no patch is needed.
 4. **Core**: start Open5GS with `open5gs-5gc.yml`, add the SIM to the subscriber database and set the phone's
    APN. PLMN 00101 and 00102 are advertised.
 5. **gNB**: `METRICS=1 bash tools/run_gnb_p501.sh examples/ocudu_gnb/gnb_p501_1x1_n78_20mhz.yaml`
@@ -59,8 +61,9 @@ interface that carries the IQ stream. The module talks to both.
 
 ## What the P501-specific settings mean
 
-- `device_args: type=p501,tx_advance_samples=199680` and `time_alignment_calibration: -199680`: the module
-  sends every TX burst 6.5 ms early, and the gNB compensates with the same amount. This gives OCUDU the
+- `device_args: type=p501,tx_advance_samples=92160` and `time_alignment_calibration: -92160`: the module
+  shifts every TX timestamp by 3 ms and removes the shift again before transmitting, so the gNB
+  compensates with the same amount. This gives OCUDU the
   RX-to-TX processing time it needs, while the board plays each burst at its timestamp (timed TX in the
   `p501_time` PL block). Keep the two numbers equal and opposite.
 - `otw_format: sc12`, `srate: 30.72`: the AD9361 port is 12 bit; 20 MHz at 30 kHz SCS needs 30.72 MS/s.
@@ -97,21 +100,17 @@ interface that carries the IQ stream. The module talks to both.
    the gNB stops: wait about 12 s, then re-add the host IP. If the gNB is killed hard, the board's RX thread stays
    blocked and the next gNB reports "exceeded maximum number of timed out receive calls" and "PRACH buffer pool
    depleted": restart `p501d` on the board.
-8. **Do not set `OCUDU_RX_TO_TX_MS`.** With a value of 10 the lower PHY discards thousands of uplink slots and the
-   UE drops (RLF). The module's `tx_advance_samples` already provides the TX lead.
-
-## OCUDU patches
-
-`ocudu/ocudu_p501.patch` contains the five local changes the test ran with: the RA response window limit in the
-DU high validator (`max_ra_resp_window = 40`), the UL pipeline depth (`4 * nof_slots_per_frame`), an
-`OCUDU_RX_TO_TX_MS` environment override in the lower PHY factory, a larger resource request pool
-(`requestArraySize = 64`) and a debug print in the PUxCH processor (`P501_DEBUG_UL`). Whether each one is
-actually needed has not been tested. The first experiment to run is the same config with `ra_resp_window: 20`
-on the patched binary, then removing the pipeline-depth and request-pool changes one at a time.
+8. **No OCUDU patch: the RAR timing budget.** The RAR has to go out within `ra_resp_window` (at most 10 ms on licensed
+   n78, so `ra_resp_window: 20` slots at 30 kHz). The RAR slot is roughly `1 + PRACH detection + tx advance + max_proc_delay`
+   slots after the PRACH slot. With the earlier 6.5 ms advance and `max_proc_delay: 10` it was 27 slots, so
+   a patch lifted the validator limit to 40 ms. With a 3 ms advance and the default `max_proc_delay: 5` the RAR fits.
+   Limits found: `max_proc_delay` 3 gives "Downlink data late" (1000+ per minute); a 4 ms advance with delay 5 still missed
+   the window by a slot; the TX lead at the USB write is then about 1 ms (median 1.2 ms, `P501_DEBUG_TX=1`), and the
+   board's PL tolerates 1 ms more. Never set `OCUDU_RX_TO_TX_MS` (it only existed in the old patch).
 
 ## Known limits
 
-- Downlink uses only about 780 PDSCH transmissions per second while the transmit buffer stays full; the reason
-  (HARQ timing, TDD pattern or scheduling) has not been investigated.
+- The phone reports CQI 5 whatever the signal (see lesson 5), and the downlink still has 3-5% HARQ failures at MCS 27.
+- Uplink throughput varies between sessions (5-12 Mbit/s) with the phone position; the cause of the difference is not found.
 - 1T1R only: no 2T2R configuration is included in this example.
 - Output power and the external reference clock input have not been measured or enabled yet.

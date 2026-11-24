@@ -17,12 +17,12 @@ cu_cp:
               - sst: 1
 ru_sdr:
   device_driver: uhd                                            # The RF driver name.
-  device_args:  type=p501,tx_advance_samples=199680   # [p501] TX is sent this many samples early (6.5 ms)
+  device_args:  type=p501,tx_advance_samples=92160   # [p501] TX timestamps are shifted this many samples (3 ms); the driver removes the shift
   clock: internal                                                       # Specify the clock source used by the RF.
   sync: internal                                                        # Specify the sync source used by the RF.
   srate: 30.72                                                  # RF sample rate might need to be adjusted according to selected bandwidth.
   otw_format: sc12   # [p501] the AD9361 port is 12 bit
-  time_alignment_calibration: -199680   # [p501] must be minus tx_advance_samples; gives the gNB the RX->TX processing time
+  time_alignment_calibration: -92160   # [p501] must be minus tx_advance_samples; gives the gNB 3 ms of RX->TX processing time
   tx_gain: 69   # [p501] 89.75 minus TX attenuation in dB (0.25 dB steps): 69 = 20.75 dB attenuation, RSRP about -87 dBm with the phone close to the antenna
   rx_gain: 30   # [p501] AD9361 gain index 0-76. 40 overloads with a phone close to the antenna; 20 sits too close to the fixed receiver noise floor
 
@@ -41,7 +41,7 @@ cell_cfg:
   ssb:
     ssb_period: 10
   prach:
-    ra_resp_window: 80
+    ra_resp_window: 20
   pdsch:
     mcs_table: qam256
     # Phones report CQI 5 regardless of signal level (see README), so link adaptation must be allowed to move far from it
@@ -75,4 +75,4 @@ pcap:
 #  enabled: true
 
 expert_phy:
-  max_proc_delay: 10
+  max_proc_delay: 5

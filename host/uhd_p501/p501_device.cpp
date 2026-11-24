@@ -528,6 +528,11 @@ private:
             if (!_sh->hw_time)
                 return true;
             const long long lag = (long long)_sh->now().to_ticks(FS) - (long long)(_msg_ts + _frames);
+            if (getenv("P501_RXLAGSTAT")) {
+                static long long lmin = 1LL << 60, lmax = -(1LL << 60), lsum = 0; static int ln = 0;
+                lmin = std::min(lmin, lag); lmax = std::max(lmax, lag); lsum += lag;
+                if (++ln == 2000) { fprintf(stderr, "RXLAGSTAT n=%d min %.2f avg %.2f max %.2f ms\n", ln, lmin / 30720.0, lsum / 30720.0 / ln, lmax / 30720.0); lmin = 1LL << 60; lmax = -(1LL << 60); lsum = 0; ln = 0; }
+            }
             if (getenv("P501_DEBUG_RX")) { static long long mx = 0; static int cnt = 0; if (lag > 122880 && cnt++ < 400) fprintf(stderr, "RXLAG %lld ticks (%.2f ms) seq=%llu\n", lag, lag / 30720.0, (unsigned long long)_next_seq); (void)mx; }
             if (lag <= lag_max())
                 return true;

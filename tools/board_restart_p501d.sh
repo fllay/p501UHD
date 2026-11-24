@@ -9,4 +9,5 @@ sleep 3
 mount | grep -q "tmpfs on /tmp " || mount -t tmpfs -o size=256m tmpfs /tmp
 export P501_BIT=${P501_BIT:-/home/xilinx/p501UHD/base_ts_txbuf/system_top.bit}
 export P501_STREAM_DEBUG=1
+export P501_TRACKING=1   # AD9361 RX DC-offset + quadrature tracking (off by default in the driver)
 bash /home/xilinx/p501UHD/kernel/ffs/p501d_start.sh

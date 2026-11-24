@@ -2,9 +2,11 @@
 // uhd_p501 -- UHD 4.6 out-of-tree device module for the PZSDR P501 (XCZU5EV + AD9361, 2R2T).
 //
 //   control : ASCII line protocol over TCP to the board daemon p501d (default 192.168.2.1:5555, tools/p501d.py)
-//   samples : USB3 bulk through the board's FunctionFS gadget (libusb); message = 56 B header + 512 KiB payload of
-//             65536 frames {I1,Q1,I2,Q2} int16 (kernel/ffs/p501_stream.c)
-//   v1      : one rate (30.72 MS/s 2R2T); no hardware time (time = host clock, timed commands are not honoured).
+//   samples : USB3 bulk through the board's FunctionFS gadget (libusb); message = 56 B header + payload of up to 65536
+//             frames {I1,Q1,I2,Q2} int16 (kernel/ffs/p501_stream_wd.c); RX messages are 32768 frames, TX messages 16384 (2 ch)
+//   time    : hardware time from the PL block p501_time (bitstreams base_ts*): timed RX start and timed TX bursts; with the
+//             plain base bitstream the host clock is used and timed commands are ignored
+//   limits  : one rate (30.72 MS/s 2R2T), one LO frequency for all channels
 //
 #include <libusb-1.0/libusb.h>
 #include <arpa/inet.h>

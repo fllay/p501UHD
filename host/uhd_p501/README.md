@@ -8,5 +8,8 @@ Host:
     uhd_find_devices --args type=p501
     sudo -E /usr/local/lib/uhd/examples/benchmark_rate --args type=p501 --rx_rate 30.72e6 --tx_rate 30.72e6 --rx_channels 0,1 --tx_channels 0,1
 
-v1 limits: fixed 30.72 MS/s 2R2T, one LO frequency for all channels (retune re-runs the AD9361 bring-up, ~1 s, stop
-streams first), no hardware time (host clock; timed commands ignored), no async underflow/late messages.
+Limits: fixed 30.72 MS/s 2R2T, one LO frequency for all channels (retune re-runs the AD9361 bring-up, ~1 s, stop
+streams first), no async underflow/late messages. Hardware time (timed RX start, timed TX bursts) needs the `base_ts` or
+`base_ts_txbuf` bitstream (`P501_BIT`); with the plain `base` bitstream the host clock is used and timed commands are ignored.
+2-channel TX messages are 16384 frames (128 KiB) by default (`P501_TXFR` overrides); see ../../README.md and
+../../examples/ocudu_gnb/README.md.

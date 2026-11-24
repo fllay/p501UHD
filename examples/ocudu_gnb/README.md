@@ -18,13 +18,11 @@ passing traffic, and the config files here are the ones that produced the number
 
 | | Throughput |
 |---|---|
-| Downlink TCP, `iperf3 -c <ue>` | about 46 Mbit/s steady (MCS 26-27, about 1000-1250 PDSCH TBs/s) |
-| Uplink TCP, `iperf3 -c <ue> -R` | 5-6.5 Mbit/s (MCS 7-9 at 14-17 dB reported SINR) |
+| Downlink TCP, `iperf3 -c <ue>` | about 47 Mbit/s steady (MCS 26-27), 3-5% HARQ failures |
+| Uplink TCP, `iperf3 -c <ue> -R` | 12-15 Mbit/s (MCS 15-17 at about 23 dB SINR), `rx_gain` 45 |
 
-Notes: with the earlier 6.5 ms advance (and the OCUDU patch) the same setup gave about 27 Mbit/s downlink. The uplink reached
-11.5-12 Mbit/s (MCS 13-14, about 20 dB SINR) in an earlier session; in this session the same phone sat at 14-17 dB and
-both the stock and the patched build gave 5-6.5 Mbit/s, so the difference is the radio conditions or the phone and is not
-caused by dropping the patch. The cause has not been found yet.
+For comparison: with the earlier 6.5 ms advance and the OCUDU patch the downlink was about 27 Mbit/s; at `rx_gain` 30 the
+uplink was 5-6.5 Mbit/s with both the stock and the patched build (see lesson 3, the receive gain is what limits it).
 
 ## Topology
 
@@ -83,9 +81,12 @@ interface that carries the IQ stream. The module talks to both.
    running mean per channel (`P501_NO_DCBLOCK=1` disables it) and the board enables the AD9361 RX DC and quadrature
    tracking (`P501_TRACKING=1`, set by `board_restart_p501d.sh`). Use `tools/pusch_by_prb.py` on a gNB log written
    with `log: phy_level: info` to see the effect per allocation.
-3. **`rx_gain`.** At 40 a phone close to the antenna overloads the receiver (the gNB log shows `ovl`). The receiver has a shaped
-   conversion noise floor that does not scale with gain (measured from 0 to 40), so low gains lose SNR. 30 is a compromise
-   for a phone close to the antenna. Measure your own with `tools/rx_noise_spectrum.py` (stop the gNB first).
+3. **`rx_gain` decides the uplink.** The receiver has a conversion noise floor that does not scale with gain, and a phone
+   at its maximum power gives a low SINR when the gain is low. Sweeping the gain live (`set_rx_gain 0 <n>` on the board's
+   control port 5555) with `iperf3 -R` and a phone at normal range gave: 30 -> 5-6 Mbit/s (SINR 15 dB, MCS 8), 36 -> 7,
+   42 -> 8-11.5, 45 -> 12-14, 48 -> 14-15 (SINR 23 dB, MCS 15-17), 51 -> 12, 54 -> 5 and 60 -> 0.6 Mbit/s with the receiver
+   overloaded (`ovl` in the metrics). 45 leaves 3 dB below the first overload. A phone very close to the antenna
+   overloads earlier (40 did at about 1 m), so lower the gain there. Measure the noise floor with `tools/rx_noise_spectrum.py`.
 4. **Link adaptation.** The default OLLA settings (1% target, 0.001 dB steps, limited range) leave both directions
    far below capacity here. The values in the YAML (10% target, faster steps, wider range) let the uplink reach MCS
    13-14 and the downlink MCS 25-27.
@@ -111,6 +112,6 @@ interface that carries the IQ stream. The module talks to both.
 ## Known limits
 
 - The phone reports CQI 5 whatever the signal (see lesson 5), and the downlink still has 3-5% HARQ failures at MCS 27.
-- Uplink throughput varies between sessions (5-12 Mbit/s) with the phone position; the cause of the difference is not found.
+- `rx_gain` is a compromise for one phone distance: the receiver overloads above about 50 at normal range and earlier when the phone is very close. An automatic gain mode has not been tried.
 - 1T1R only: no 2T2R configuration is included in this example.
 - Output power and the external reference clock input have not been measured or enabled yet.

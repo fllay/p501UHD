@@ -24,7 +24,7 @@ ru_sdr:
   otw_format: sc12   # [p501] the AD9361 port is 12 bit
   time_alignment_calibration: -92160   # [p501] must be minus tx_advance_samples; gives the gNB 3 ms of RX->TX processing time
   tx_gain: 69   # [p501] 89.75 minus TX attenuation in dB (0.25 dB steps): 69 = 20.75 dB attenuation, RSRP about -87 dBm with the phone close to the antenna
-  rx_gain: 30   # [p501] AD9361 gain index 0-76. 40 overloads with a phone close to the antenna; 20 sits too close to the fixed receiver noise floor
+  rx_gain: 45   # [p501] AD9361 gain index 0-76. Swept with a phone at normal range: 30 -> 5 Mbit/s UL, 45 -> 14, 48 -> 15, 54+ overloads (ovl). Lower it if the phone is very close
 
 cell_cfg:
   dl_arfcn: 632628                                                # ARFCN of the downlink carrier (center frequency).

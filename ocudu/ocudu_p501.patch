@@ -24,6 +24,36 @@ index b968e073d5..1ef3ac91e5 100644
  
      const prach_configuration prach_cfg =
          prach_configuration_get(cell.freq_range, cell.duplex, cell.prach_config_index);
+diff --git a/lib/phy/lower/lower_phy_factory.cpp b/lib/phy/lower/lower_phy_factory.cpp
+index 21f01b2092..b545c6962f 100644
+--- a/lib/phy/lower/lower_phy_factory.cpp
++++ b/lib/phy/lower/lower_phy_factory.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
+ 
++#include <cstdlib>
+ #include "ocudu/phy/lower/lower_phy_factory.h"
+ #include "lower_phy_impl.h"
+ 
+@@ -97,7 +98,7 @@ public:
+     int tx_time_offset = get_tx_time_offset(config.time_alignment_calibration, config.ta_offset, config.srate);
+ 
+     // Maximum time delay between reception and transmission in samples (1ms plus the time offset).
+-    unsigned rx_to_tx_max_delay = config.srate.to_kHz() + tx_time_offset;
++    unsigned rx_to_tx_max_delay = config.srate.to_kHz() * (getenv("OCUDU_RX_TO_TX_MS") ? (unsigned)atoi(getenv("OCUDU_RX_TO_TX_MS")) : 1U) + tx_time_offset;
+ 
+     // Prepare downlink processor configuration.
+     downlink_processor_configuration dl_proc_config = {.sector_id               = config.sector_id,
+@@ -134,7 +135,7 @@ public:
+         .nof_tx_ports           = config.nof_tx_ports,
+         .nof_rx_ports           = config.nof_rx_ports,
+         .tx_time_offset         = static_cast<baseband_gateway_timestamp>(tx_time_offset),
+-        .rx_to_tx_max_delay     = config.srate.to_kHz() + proc_bb_adaptor_config.tx_time_offset,
++        .rx_to_tx_max_delay     = config.srate.to_kHz() * (getenv("OCUDU_RX_TO_TX_MS") ? (unsigned)atoi(getenv("OCUDU_RX_TO_TX_MS")) : 1U) + proc_bb_adaptor_config.tx_time_offset,
+         .rx_buffer_size         = rx_buffer_size,
+         .nof_rx_buffers         = std::max(4U, rx_to_tx_max_delay / rx_buffer_size),
+         .system_time_throttling = config.system_time_throttling,
 diff --git a/lib/phy/lower/processors/resource_request_pool.h b/lib/phy/lower/processors/resource_request_pool.h
 index 4f39fc3234..e2ce330530 100644
 --- a/lib/phy/lower/processors/resource_request_pool.h
@@ -37,3 +67,29 @@ index 4f39fc3234..e2ce330530 100644
  class resource_request_pool
  {
  public:
+diff --git a/lib/phy/lower/processors/uplink/puxch/puxch_processor_impl.cpp b/lib/phy/lower/processors/uplink/puxch/puxch_processor_impl.cpp
+index 49802599dd..ba1f0d89fd 100644
+--- a/lib/phy/lower/processors/uplink/puxch/puxch_processor_impl.cpp
++++ b/lib/phy/lower/processors/uplink/puxch/puxch_processor_impl.cpp
+@@ -3,6 +3,8 @@
+ // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
+ 
+ #include "puxch_processor_impl.h"
++#include <cstdio>
++#include <cstdlib>
+ #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_reader.h"
+ #include "ocudu/phy/lower/lower_phy_rx_symbol_context.h"
+ #include "ocudu/phy/support/resource_grid_context.h"
+@@ -72,6 +74,12 @@ void puxch_processor_impl::handle_request(const shared_resource_grid& grid, cons
+ 
+   ocudu_assert(notifier != nullptr, "Notifier has not been connected.");
+ 
++  if (getenv("P501_DEBUG_UL")) {
++    static int cnt = 0;
++    if (cnt++ < 100000) {
++      fprintf(stderr, "ULREQ slot=%u.%u ahead_of_rx=%d\n", context.slot.sfn(), context.slot.slot_index(), (int)(context.slot - current_slot));
++    }
++  }
+   // Swap the new request by the current request in the circular array.
+   auto request = requests.exchange({context.slot, grid.copy()});
+ 

@@ -584,19 +584,37 @@ private:
         const size_t st = _fb / 2; // int16 per frame
         const int16_t* src = (const int16_t*)(_cur->buffer + sizeof(hdr_t)) + st * _off;
         if (const char* dp = getenv("P501_RXDUMP")) { static FILE* df = fopen(dp, "wb"); static size_t dn = 0; if (df && dn < 6000000) { fwrite(src, _fb, n, df); dn += n; if (dn >= 6000000) fclose(df); } }
+        if (_dc_i.size() < _chans.size()) {
+            _dc_i.assign(_chans.size(), 0.0); _dc_q.assign(_chans.size(), 0.0); _dc_cnt.assign(_chans.size(), 0);
+        }
         for (size_t c = 0; c < _chans.size(); c++) {
             const int16_t* s = src + 2 * rch_lane(_mask, _rch[c]);
+            // The AD9361 path leaves a fixed DC offset (~-37 dBFS) that lands on the DC subcarrier and wrecks the
+            // PUSCH SINR estimate of every full-band grant. Track it with a slow (~75 Hz) block-wise mean and subtract it.
+            float dci = 0.f, dcq = 0.f;
+            if (_dcblock && n > 0) {
+                int64_t si = 0, sq = 0;
+                for (size_t i = 0; i < n; i++) { si += s[st * i]; sq += s[st * i + 1]; }
+                const double mi = double(si) / double(n), mq = double(sq) / double(n);
+                double w = 1.0 - std::exp(-double(n) / 65536.0);
+                const double wc = double(n) / (double(_dc_cnt[c]) + double(n));
+                if (wc > w) w = wc;
+                _dc_i[c] += w * (mi - _dc_i[c]);
+                _dc_q[c] += w * (mq - _dc_q[c]);
+                _dc_cnt[c] += n;
+                dci = float(_dc_i[c]); dcq = float(_dc_q[c]);
+            }
             if (_fc32) {
                 float* d = (float*)buffs[c] + 2 * dst;
                 for (size_t i = 0; i < n; i++) {
-                    d[2 * i]     = float(s[st * i]) * (1.0f / 2048.0f);
-                    d[2 * i + 1] = float(s[st * i + 1]) * (1.0f / 2048.0f);
+                    d[2 * i]     = (float(s[st * i]) - dci) * (1.0f / 2048.0f);
+                    d[2 * i + 1] = (float(s[st * i + 1]) - dcq) * (1.0f / 2048.0f);
                 }
             } else {
                 int16_t* d = (int16_t*)buffs[c] + 2 * dst;
                 for (size_t i = 0; i < n; i++) {
-                    d[2 * i]     = int16_t(s[st * i] * 16); // the AD9361 port is 12 bit right-justified
-                    d[2 * i + 1] = int16_t(s[st * i + 1] * 16);
+                    d[2 * i]     = int16_t((float(s[st * i]) - dci) * 16.0f); // the AD9361 port is 12 bit right-justified
+                    d[2 * i + 1] = int16_t((float(s[st * i + 1]) - dcq) * 16.0f);
                 }
             }
         }
@@ -663,6 +681,9 @@ private:
     std::vector<size_t> _chans, _rch;
     int _mask = 3, _fb = 8;
     std::vector<libusb_transfer*> _xfers;
+    bool _dcblock = !getenv("P501_NO_DCBLOCK");
+    std::vector<double> _dc_i, _dc_q;
+    std::vector<uint64_t> _dc_cnt;
     std::mutex _m, _cmd_m, _stop_m;
     std::condition_variable _cv;
     std::deque<libusb_transfer*> _q, _retry;

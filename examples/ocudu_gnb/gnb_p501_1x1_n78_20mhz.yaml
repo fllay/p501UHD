@@ -1,5 +1,5 @@
 # OCUDU gNB on the PZSDR P501 through the uhd_p501 UHD module: band n78, 20 MHz, 30 kHz SCS, 1T1R.
-# Tested with OCUDU commit bd0d2cd27c + ocudu/ocudu_p501.patch, board bitstream p501/base_ts_txbuf, PLMN 00101.
+# Tested with OCUDU commit bd0d2cd27c (stock, no patch), board bitstream p501/base_ts_txbuf, PLMN 00101.
 # Lines marked [p501] are specific to this radio; see examples/ocudu_gnb/README.md.
 cu_cp:
   amf:

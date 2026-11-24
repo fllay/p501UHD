@@ -6,7 +6,11 @@ CFG=${1:-/home/pi/src/5gconfig/p501_1x1_new.yaml}
 LOG=${GNB_LOG:-/tmp/gnb.log}
 MODDIR=/tmp/uhdmod_auth
 mkdir -p $MODDIR && cp /home/pi/projects/p501UHD/host/uhd_p501/build/libuhd_p501.so $MODDIR/
-pkill -INT -x gnb; sleep 3; pkill -KILL -x gnb
+# graceful stop first: killing the gNB while it is still shutting down leaves the board's RX thread blocked (new gNB then gets
+# 'exceeded maximum number of timed out receive calls'; fix = restart p501d on the board)
+pkill -INT -x gnb
+for i in $(seq 1 25); do pgrep -x gnb >/dev/null || break; sleep 1; done
+pkill -KILL -x gnb
 sleep 12                                   # the board re-enumerates USB when the streams stop; opening it earlier gives NO_DEVICE
 ip -br a show enx021a2b3c4d12 | grep -q 192.168.2.10 || echo "warning: host IP 192.168.2.10/24 missing on enx021a2b3c4d12 (sudo ip addr add 192.168.2.10/24 dev enx021a2b3c4d12)"
 cd "$(dirname "$CFG")"

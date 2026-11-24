@@ -211,6 +211,10 @@ public:
         }
         _run = true;
         _thr = std::thread([this] {
+            {   // completions of the 16 RX / 12 TX bulk transfers are handled here: a late wake-up is late RX data for the gNB
+                sched_param sp; sp.sched_priority = getenv("P501_USB_PRIO") ? atoi(getenv("P501_USB_PRIO")) : 60;
+                if (sp.sched_priority > 0) pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+            }
             while (_run) {
                 timeval tv = {0, 100000};
                 libusb_handle_events_timeout(_ctx, &tv);
@@ -728,7 +732,8 @@ public:
             _rch.push_back(getenv("P501_TX_SWAP") ? 1 - c : c);
         _mask = rch_mask(_rch);
         _fb   = 4 * __builtin_popcount(_mask);
-        _txfr = _fb == 8 ? FRAMES : FRAMES / 2; // message = 512 KiB (2 channels) or 128 KiB (1 channel)
+        _txfr = _fb == 8 ? FRAMES / 4 : FRAMES / 2; // message = 128 KiB (0.53 ms) for 2 channels, 128 KiB (1.07 ms) for 1 channel; the board sizes its TX slots to match (P501_TXP_KIB=128)
+        if (const char* e = getenv("P501_TXFR")) _txfr = (size_t)atoi(e); // experiment: shorter TX messages
         _pl   = _txfr * _fb;
         usb_t& u = _sh->get_usb();
         for (int i = 0; i < NX; i++) {

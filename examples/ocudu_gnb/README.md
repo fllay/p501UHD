@@ -7,11 +7,13 @@ passing traffic, and the config files here are the ones that produced the number
 | File | What it is |
 |---|---|
 | `gnb_p501_1x1_n78_20mhz.yaml` | OCUDU gNB config: band n78, ARFCN 632628 (3489.42 MHz), 20 MHz, 30 kHz SCS, PCI 3, TAC 7, PLMN 00101, 1T1R |
+| `gnb_p501_2x2_n78_20mhz.yaml` | the same cell with 2T2R and a 3.5 ms TX advance (see "2x2 MIMO" below) |
 | `open5gs-5gc.yml` | Open5GS all-in-one core config used with it (AMF 10.53.1.2, GTP-U MTU 1400) |
 | `../../tools/run_gnb_p501.sh` | persistent gNB launcher: graceful stop, waits for the USB re-enumeration, `METRICS=1` prints per-UE metrics |
 | `../../tools/core_watchdog.sh` | restarts the Open5GS container (and the gNB) when the AMF dies |
 | `../../tools/board_restart_p501d.sh` | restarts the board daemon (run as root on the board) |
 | `../../tools/full_restart_gnb.sh` | graceful gNB stop, board restart, host IP, gNB start in one go |
+| `../../tools/usbout_test.cpp` | standalone host-to-board USB OUT throughput test (message size and queue depth sweep) |
 | `../../tools/rx_noise_spectrum.py`, `../../tools/pusch_by_prb.py` | receiver noise capture and PUSCH SINR-by-allocation analysis |
 
 ## Result (stock OCUDU, one phone close to the antenna, RSRP about -87 dBm)
@@ -109,9 +111,45 @@ interface that carries the IQ stream. The module talks to both.
    the window by a slot; the TX lead at the USB write is then about 1 ms (median 1.2 ms, `P501_DEBUG_TX=1`), and the
    board's PL tolerates 1 ms more. Never set `OCUDU_RX_TO_TX_MS` (it only existed in the old patch).
 
+9. **TX buffering is counted in messages, not time.** The board's TX ring has 64 slots of 512 KiB whatever the message length (`P501_TXP_KIB` now sizes
+   the slot), and the host has 12 transfers in flight. At startup the gNB sends TX about 100 ms ahead. With 0.53 ms messages that does not fit (34 ms), so
+   the USB write blocks the gNB's TX thread, the gNB stops reading RX, the board's RX DMA overflows (`HWOVF` in `/tmp/p501d.log`) and the RX timestamps,
+   which count delivered messages, stay behind hardware time for good: every TX burst is then dropped as late. If `RXLAGSTAT` (`P501_RXLAGSTAT=1`) shows a
+   constant lag above a few ms from startup, look for `HWOVF` on the board.
+
+## 2x2 MIMO (stock OCUDU, `gnb_p501_2x2_n78_20mhz.yaml`)
+
+Two TX and two RX channels run on stock OCUDU with the same RAR settings as 1x1 (`ra_resp_window: 20`,
+`max_proc_delay: 5`), but only with the board and host changes listed here. Measured with two phones attached, one iperf3 server:
+
+| | 1x1 | 2x2 |
+|---|---|---|
+| Downlink TCP | about 47 Mbit/s | 26-31 Mbit/s (rank 2, MCS 20-23, about 12% HARQ failures) |
+| Uplink TCP | 12-15 Mbit/s | 18-19 Mbit/s (SINR about 28 dB) |
+
+2x2 is not as solid as 1x1: the board still drops about 3% of the TX messages (they reached it with less than 0.2 ms lead), the gNB
+logs a few "PUxCH request late" / "Discarded uplink slot" warnings per minute, and a phone occasionally re-attaches under load.
+Phones report a realistic CQI (13-14) in rank 2, unlike the constant 5 in 1x1.
+
+What 2x2 needs on top of the 1x1 setup (all in this repository):
+
+- **TX advance 3.5 ms** (`tx_advance_samples=107520`, `time_alignment_calibration: -107520`). At 3 ms about 8% of the TX bursts arrive too late and RARs are
+  missed; at 4 ms the RAR window is missed (7 RAR failures in the first minutes).
+- **Board `p501_stream` built from `kernel/ffs/p501_stream_wd.c`** (`gcc -O2 -pthread -o p501_stream p501_stream_wd.c`): the TX USB reader uses FunctionFS AIO with
+  6 requests queued, the cache flush runs in its own thread, and the threads are pinned (RX thread CPU3 priority 80, TX reader and flusher CPU2, submitter CPU1;
+  CPU0 is left to the USB interrupt thread).
+- **`P501_TXP_KIB=128` and the USB IRQ thread at priority 90** on the board (`tools/board_restart_p501d.sh` does both; install it on the board as `/home/xilinx/restart3.sh`, which `tools/full_restart_gnb.sh` calls).
+- **Host driver**: 2-channel TX messages are 16384 frames (128 KiB, 0.53 ms) instead of 65536 frames (2.1 ms). The libusb event thread runs at SCHED_FIFO 60
+  (`P501_USB_PRIO`, 0 disables it). `P501_TXFR=<frames>` overrides the message length.
+- **Host settings**: `usbfs_memory_mb` 256 (`/etc/modprobe.d/usbfs.conf`: `options usbcore usbfs_memory_mb=256`), CPU governor `performance`.
+
+Why short messages: a 2-channel 65536-frame message is 512 KiB, 2.1 ms of samples and about 2.1 ms on the USB link. The TX lead at the USB write is then
+negative with a 3 ms advance, so the board dropped every burst as already due. The old patch hid that with a 6 ms advance. 128 KiB messages cut the fill and transfer time
+to a quarter. The board sustains 300-460 MB/s for messages of 64-512 KiB (`tools/usbout_test.cpp`), against 245 MB/s needed.
+
 ## Known limits
 
 - The phone reports CQI 5 whatever the signal (see lesson 5), and the downlink still has 3-5% HARQ failures at MCS 27.
 - `rx_gain` is a compromise for one phone distance: the receiver overloads above about 50 at normal range and earlier when the phone is very close. An automatic gain mode has not been tried.
-- 1T1R only: no 2T2R configuration is included in this example.
+- 2x2 works (see above) but is less stable than 1x1; 2R1T was not stable on stock OCUDU.
 - Output power and the external reference clock input have not been measured or enabled yet.

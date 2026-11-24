@@ -109,6 +109,8 @@ static const struct {
 #define REQ_RX_START_AT 8
 #define HF_TX_TIMED 4u
 #include <sched.h>
+#include <sched.h>
+static void pin_cpu(int cpu) { cpu_set_t m; CPU_ZERO(&m); CPU_SET(cpu, &m); if (sched_setaffinity(0, sizeof m, &m)) perror("affinity"); }   // CPU0 is left to the USB IRQ thread
 static void rt_prio(int prio) { struct sched_param sp = { .sched_priority = prio }; if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp)) perror("SCHED_FIFO"); }
 static volatile uint32_t *tm;                                  // p501_time registers (NULL if the bitstream has none)
 static pthread_mutex_t tm_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -151,7 +153,7 @@ static int submit(int is_tx, int slot)
 static volatile uint64_t rx_start_ts; static volatile int rx_timed_req;
 static void *rx_thread(void *a)
 {
-	rt_prio(60);
+	rt_prio(80); pin_cpu(3);
 	uint64_t nsub = 0, nsend = 0, seq = 0, cs = 0; uint32_t flags = 0; double t0 = now();
 	const uint64_t nch = slot_bytes / rxp;
 	a9361[0x88 / 4] = 4;                                          // clear sticky ADC overflow
@@ -200,37 +202,77 @@ static int dbg_d, dbg_r; static int dbg_on;
 static struct txmeta *tx_meta; static uint64_t tx_next_ts;
 static volatile uint64_t tx_released_v; static volatile double tx_last_fill;
 
+static volatile uint64_t tx_rd_v;                              // messages read from USB, meta set (published in order)
+// The USB read is kept free of cache maintenance: the next readv must be queued at once, or the OUT endpoint idles between
+// messages and the stream cannot keep real time with short messages. tx_flusher does the cache flush and publishes tx_filled_v.
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#ifndef TX_AIO_DEPTH
+#define TX_AIO_DEPTH 6
+#endif
+// AIO keeps TX_AIO_DEPTH USB OUT requests queued on the endpoint at all times, so the copy-out of one message
+// (done by FunctionFS before a sync readv returns) no longer leaves the endpoint idle.
 static void *tx_reader(void *a)
 {
-	rt_prio(60);
+	rt_prio(60); pin_cpu(2);
+	aio_context_t ctx = 0; int R = tx_ring_msgs;
+	if (syscall(SYS_io_setup, TX_AIO_DEPTH * 2, &ctx)) { perror("io_setup"); tx_run = 0; __atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL; }
+	struct hdr *hs = calloc(R, sizeof *hs); struct iovec *iov = calloc(R, 2 * sizeof *iov); struct iocb *cb = calloc(R, sizeof *cb);
+	ssize_t *res = calloc(R, sizeof *res); char *dn = calloc(R, 1);
+	uint64_t sub = 0, rd = 0; int end = 0;
+	while (tx_run && !end) {
+		while (sub - rd < TX_AIO_DEPTH && sub < tx_released_v + (uint64_t)R) {           // keep the endpoint fed
+			int k = sub % R; char *base = tx_ring + (size_t)k * txp;
+			iov[2*k] = (struct iovec){ &hs[k], sizeof hs[k] }; iov[2*k+1] = (struct iovec){ base, txp };
+			memset(&cb[k], 0, sizeof cb[k]);
+			cb[k].aio_lio_opcode = IOCB_CMD_PREADV; cb[k].aio_fildes = ep_out; cb[k].aio_buf = (uintptr_t)&iov[2*k]; cb[k].aio_nbytes = 2; cb[k].aio_data = sub;
+			struct iocb *p = &cb[k]; dn[k] = 0;
+			if (syscall(SYS_io_submit, ctx, 1, &p) != 1) { perror("io_submit"); end = 1; break; }
+			sub++;
+		}
+		if (end) break;
+		struct io_event ev[TX_AIO_DEPTH * 2]; struct timespec to = { 0, 2000000 };
+		int ne = syscall(SYS_io_getevents, ctx, 1, TX_AIO_DEPTH * 2, ev, &to);
+		if (ne < 0) { if (errno == EINTR) continue; perror("io_getevents"); break; }
+		for (int i = 0; i < ne; i++) { int k = ev[i].data % R; res[k] = ev[i].res; dn[k] = 1; }
+		while (sub > rd && dn[rd % R]) {
+			int k = rd % R; ssize_t n = res[k]; struct hdr h = hs[k]; char *base = tx_ring + (size_t)k * txp; dn[k] = 0;
+			if (n < 0) { if (n == -EINTR) { end = 1; break; } fprintf(stderr, "aio read err %zd\n", n); end = 1; break; }
+			if (n >= (ssize_t)sizeof h && h.magic == MAGIC && (h.flags & HF_END)) { end = 1; break; }
+			if (n < (ssize_t)sizeof h || h.magic != MAGIC) { st.tx_bad++; fprintf(stderr, "tx bad hdr n=%zd\n", n); end = 1; break; }
+			struct txmeta *tmeta = &tx_meta[rd % R];
+			uint64_t t_rd = ts_now(); { static uint64_t prev_rd; if (prev_rd && t_rd > prev_rd) hist_add(h_gap, (int64_t)(t_rd - prev_rd), 0, 7680); prev_rd = t_rd; }
+			if (h.flags & HF_TX_TIMED) {
+				uint32_t bytes = (uint32_t)(n - sizeof h);
+				if (!bytes || bytes > txp || (bytes % tx_fb) || bytes != h.payload_len) { st.tx_bad++; fprintf(stderr, "tx bad len\n"); end = 1; break; }
+				if (bytes & 15) { uint32_t pad = 16 - (bytes & 15); memset(base + bytes, 0, pad); bytes += pad; }
+				tmeta->start = h.chunk; tmeta->bytes = bytes; tmeta->timed = 1; tmeta->t_rd = t_rd;
+			} else {
+				if (n != (ssize_t)(sizeof h + txp)) { st.tx_bad++; fprintf(stderr, "tx bad untimed len\n"); end = 1; break; }
+				tmeta->start = 0; tmeta->bytes = txp; tmeta->timed = 0;
+			}
+			__sync_synchronize();
+			rd++; tx_rd_v = rd; st.tx_msgs++; tx_last_fill = now();
+		}
+	}
+	syscall(SYS_io_destroy, ctx);                                   // cancels whatever is still queued on the endpoint
+	free(hs); free(iov); free(cb); free(res); free(dn);
+	tx_run = 0; __atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
+}
+
+static void *tx_flusher(void *a)
+{
+	rt_prio(65); pin_cpu(2);
 	uint64_t filled = 0;
 	while (tx_run) {
-		while (tx_run && filled >= tx_released_v + (uint64_t)tx_ring_msgs) usleep(100);        // ring full
-		if (!tx_run) break;
-		char *base = tx_ring + (size_t)(filled % tx_ring_msgs) * txp;
-		struct hdr h; struct iovec iov[2] = { { &h, sizeof h }, { base, txp } };
-		ssize_t n = readv(ep_out, iov, 2);
-		if (n < 0) { if (errno == EINTR) continue; perror("readv ep2"); break; }
-		if (n >= (ssize_t)sizeof h && h.magic == MAGIC && (h.flags & HF_END)) break;
-		if (n < (ssize_t)sizeof h || h.magic != MAGIC) { st.tx_bad++; continue; }
-		struct txmeta *tmeta = &tx_meta[filled % tx_ring_msgs];
-		uint64_t t_rd = ts_now(); { static uint64_t prev_rd; if (prev_rd && t_rd > prev_rd) hist_add(h_gap, (int64_t)(t_rd - prev_rd), 0, 7680); prev_rd = t_rd; }
-		{ if (dbg_on && dbg_r < 10) { dbg_r++; printf("rd filled=%llu seq=%llu chunk=%llu flags=%x n=%zd\n", (unsigned long long)filled, (unsigned long long)h.seq, (unsigned long long)h.chunk, h.flags, n); fflush(stdout); } }
-		if (h.flags & HF_TX_TIMED) {
-			uint32_t bytes = (uint32_t)(n - sizeof h);
-			if (!bytes || bytes > txp || (bytes % tx_fb) || bytes != h.payload_len) { st.tx_bad++; continue; }
-			if (bytes & 15) { uint32_t pad = 16 - (bytes & 15); memset(base + bytes, 0, pad); bytes += pad; }            // DMA length multiple of 16: pad one zero frame
-			tmeta->start = h.chunk; tmeta->bytes = bytes; tmeta->timed = 1; tmeta->t_rd = t_rd;
-			civac(base, bytes);
-		} else {
-			if (n != (ssize_t)(sizeof h + txp)) { st.tx_bad++; continue; }
-			tmeta->start = 0; tmeta->bytes = txp; tmeta->timed = 0;
-			civac(base, txp);
-		}
-		__sync_synchronize();
-		filled++; tx_filled_v = filled; st.tx_filled = filled; st.tx_msgs++; tx_last_fill = now();
+		if (filled < tx_rd_v) {
+			struct txmeta *m = &tx_meta[filled % tx_ring_msgs];
+			civac(tx_ring + (size_t)(filled % tx_ring_msgs) * txp, m->bytes);
+			__sync_synchronize();
+			filled++; tx_filled_v = filled; st.tx_filled = filled;
+		} else usleep(20);
 	}
-	tx_run = 0; __atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
+	__atomic_fetch_sub(&tx_alive, 1, __ATOMIC_SEQ_CST); return NULL;
 }
 
 static int submit_tx(uint64_t msg, uint64_t bytes)
@@ -254,7 +296,7 @@ static uint64_t n_resync, n_drop;
 // TX_PRIME_MSGS are queued, or when data has been waiting 20 ms (a short burst).
 static void *tx_submitter(void *a)
 {
-	rt_prio(70);
+	rt_prio(70); pin_cpu(1);
 	uint64_t sub = 0, xfers = 0, ends[8] = {0}; int primed = 0, cnt = 0;
 	uint32_t last_late = tm ? tm[0x30 / 4] : 0; double last_rs = 0;
 	a9361[0x4088 / 4] = 1;                                        // clear sticky DAC underflow
@@ -334,7 +376,7 @@ static void start_tx(void)
 	pthread_t t1, t2; if (tx_alive || ep_out < 0) return;
 	tx_ring_msgs = tx_nslots * (int)(slot_bytes / txp);
 	memset(h_lead_rd, 0, sizeof h_lead_rd); memset(h_lead_wr, 0, sizeof h_lead_wr); memset(h_lat, 0, sizeof h_lat); memset(h_gap, 0, sizeof h_gap); h_n_neg_rd = h_n_neg_wr = 0; memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = tx_released_v = 0; tx_last_fill = now(); tx_next_ts = 0; dbg_d = 0; dbg_r = 0; tcmd(5, 0, tx_timed_mode ? 1 : 0);
-	tx_alive = 2; tx_run = 1; pthread_create(&t1, NULL, tx_reader, NULL); pthread_detach(t1); pthread_create(&t2, NULL, tx_submitter, NULL); pthread_detach(t2);
+	tx_rd_v = 0; tx_alive = 3; tx_run = 1; pthread_create(&t1, NULL, tx_reader, NULL); pthread_detach(t1); pthread_create(&t2, NULL, tx_submitter, NULL); pthread_detach(t2); pthread_t t3; pthread_create(&t3, NULL, tx_flusher, NULL); pthread_detach(t3);
 }
 
 // One channel pair per bit (bit0 = RX1/TX1, bit1 = RX2/TX2). The PL packers (util_cpack2 / util_upack2) pack only the
@@ -354,7 +396,7 @@ static void set_tx_mask(int mask)
 {
 	if (!(mask & 3)) mask = 3;
 	for (int ch = 0; ch < 4; ch++) a9361[(0x4418 + ch * 0x40) / 4] = ((mask >> (ch / 2)) & 1) ? 2 : 3;   // DATA_SEL: 2 = DMA, 3 = zero
-	tx_fb = 4 * __builtin_popcount(mask & 3); txp = tx_fb == 8 ? (size_t)512 * 1024 : (size_t)128 * 1024;
+	tx_fb = 4 * __builtin_popcount(mask & 3); txp = tx_fb == 8 ? (size_t)512 * 1024 : (size_t)128 * 1024; if (getenv("P501_TXP_KIB")) { txp = (size_t)atoi(getenv("P501_TXP_KIB")) * 1024; tx_ring_msgs = tx_nslots * (int)(slot_bytes / txp); }
 	printf("tx mask %d: frame %d B, message %zu B\n", mask & 3, tx_fb, txp); fflush(stdout);
 }
 

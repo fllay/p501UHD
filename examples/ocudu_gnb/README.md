@@ -139,6 +139,11 @@ Two TX and two RX channels run on stock OCUDU with the same RAR settings as 1x1 
 logs a few "PUxCH request late" / "Discarded uplink slot" warnings per minute, and a phone occasionally re-attaches under load.
 Phones report a realistic CQI (13-14) in rank 2, unlike the constant 5 in 1x1.
 
+Later 2x2 results (see the Results table in the top-level README): with `tools/pin_gnb.sh` the late-uplink warnings dropped
+about 8x, and at 23.04 MS/s (`gnb_p501_2x2_n78_20mhz_2304.yaml`, `P501_RXMAXSAMPS=5760`) they are gone. One phone then
+reached 78.9 Mbit/s DL and 11.2 Mbit/s UL, two phones 50 + 51 Mbit/s DL. The TX-message drops at the board no longer show
+up (`late=0`, `unf=0`).
+
 What 2x2 needs on top of the 1x1 setup (all in this repository):
 
 - **TX advance 3.5 ms** (`tx_advance_samples=107520`, `time_alignment_calibration: -107520`). At 3 ms about 8% of the TX bursts arrive too late and RARs are

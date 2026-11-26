@@ -107,21 +107,37 @@ The 1x1 config is `gnb_p501_1x1_n78_20mhz.yaml`. Details, the Open5GS setup and 
 
 ## Results
 
-Cell n78, ARFCN 632628, 20 MHz, 30 kHz SCS, `rx_gain` 45, `tx_gain` 69, phones at normal range, stock OCUDU, TCP with iperf3:
+Cell n78, ARFCN 632628, 20 MHz, 30 kHz SCS, stock OCUDU, TCP with iperf3 (one 20-30 s run per figure, so a few Mbit/s
+either way is noise). Sum of both phones where two are attached.
 
-| | Downlink | Uplink | Notes |
-|---|---|---|---|
-| 1x1 | about 47 Mbit/s (MCS 26-27, 3-5% HARQ failures) | 12-15 Mbit/s (MCS 15-17, SINR about 23 dB) | 3 ms TX advance |
-| 2x2 | 26-31 Mbit/s (rank 2, MCS 20-23, about 12% HARQ failures) | 18-19 Mbit/s (SINR about 28 dB) | 3.5 ms TX advance; about 3% of TX messages reach the board late; phones occasionally re-attach under load |
+| Setup | Phones | Downlink | Uplink | Notes |
+|---|---|---|---|---|
+| 1x1, 30.72 MS/s, TX 69 / RX 45 | 1 | about 47 Mbit/s (MCS 26-27) | 12-15 Mbit/s (SINR about 23 dB) | 3 ms TX advance |
+| 2x2, 30.72 MS/s, TX 69 / RX 45 | 2 | 26-31 Mbit/s per phone (rank 2, MCS 20-23, ~12% HARQ failures) | 18-19 Mbit/s | first 2x2 result; ~3% of TX messages late at the board |
+| 2x2, 30.72 MS/s, TX 69 / RX 25, phones next to the antennas | 2 | 65 + 73 Mbit/s | 4.7 + 4.5 Mbit/s | RX 45 overloaded the AD9361 at this range (`ovl`, UL SINR -2 dB) |
+| 2x2, 30.72 MS/s, TX 82 / RX 40, threads pinned | 2 | 42.5 + 48.2 Mbit/s | 5.6 + 5.8 Mbit/s | ~60 `PUxCH request late` per test, 10-15 ms RX lag spikes |
+| **2x2, 23.04 MS/s**, TX 82 / RX 40, pinned, `P501_RXMAXSAMPS=5760` | 1 | **78.9 Mbit/s** (rank 2, MCS 27, 5% HARQ failures) | 11.2 Mbit/s | no late-uplink warnings |
+| 2x2, 23.04 MS/s, same | 2 | 50.1 + 51.0 Mbit/s (rank 2, MCS 27) | 3.5 + 3.6 Mbit/s | UL MCS 8-10: RX gain too low for this range |
+| 2x2, 23.04 MS/s, RX 50 (manual sweep) | 2 | - | 7.2 + 8.0 Mbit/s | sweep 30-60: 50 best, 55 clips, 30 too weak |
+| 2x2, 23.04 MS/s, board AGC on | 1 | - | 11.4-12.2 Mbit/s | AGC went 35 -> 43 and 62 -> 44-46 |
 
-How the numbers moved: the uplink went from 5-6 to 12-15 Mbit/s when `rx_gain` went from 30 to 45 (the AD9361 noise floor is set
-by the ADC, not the gain). The downlink went from 27 to 47 Mbit/s when the TX advance went from 6.5 to 3 ms and the OCUDU patch
-was dropped. 2x2 needed short TX messages and a different TX ring, see the example README.
+What moved the numbers:
+- **RX gain.** The best `rx_gain` depends on the distance to the phones (25 next to the antennas, 45-50 a few metres
+  away). Too high clips the AD9361 (`ovl` in the gNB metrics, UL MCS 1); too low leaves UL MCS at 6-10. The board AGC
+  (`P501_AGC=1`) now sets it from the uplink slots.
+- **TX advance and the OCUDU patch.** The 1x1 downlink went from 27 to 47 Mbit/s when the TX advance went from 6.5 to 3 ms
+  and the OCUDU patch was dropped. 2x2 needed short TX messages and a different TX ring, see the example README.
+- **TX gain.** With the phones a few metres away, TX 82 instead of 69 took 2x2 DL from 28 + 35 to 41 + 43 Mbit/s.
+- **Thread pinning** (`tools/pin_gnb.sh`) cut the late-uplink warnings about 8x (392 -> 48 per test).
+- **23.04 MS/s.** At 30.72 MS/s the board's USB IN path is about 90% busy (a 256 KiB write takes 0.95 ms for 1.07 ms of
+  samples), so any stall left 10-15 ms of RX backlog; 23.04 MS/s gives it 30% headroom. RX lag spikes dropped to about
+  6 ms and the late-uplink warnings to zero, but only with a small gNB RX buffer (`P501_RXMAXSAMPS=5760`, 0.25 ms):
+  with the default 65536 samples (2.8 ms at this rate) the gNB logs hundreds of them per second.
+- **Board temperature** is a suspect for worse results in a warm room (a hot board and reference clock gave lower DL MCS
+  and more HARQ failures); not measured yet, the board exposes no temperature sensor to Linux.
 
-2x2 at 23.04 MS/s (`gnb_p501_2x2_n78_20mhz_2304.yaml`, `tx_gain` 82, `rx_gain` 40, `P501_RXMAXSAMPS=5760`, gNB threads
-pinned with `tools/pin_gnb.sh`), one phone: DL 78.9 Mbit/s (rank 2, MCS 27, 5% HARQ failures), UL 11.2 Mbit/s, no
-`PUxCH request late` warnings. At 30.72 MS/s the board's USB IN path is about 90% busy (a 256 KiB write takes 0.95 ms for
-1.07 ms of samples), so any stall left 10-15 ms of RX backlog; 23.04 MS/s gives it 30% headroom.
+Open: the uplink is lower in 2x2 with two phones than with one, and one 23.04 MS/s bring-up came up with CQI 4 and MCS 0
+on the downlink (the next restart was fine), probably a random AD9361 calibration state.
 
 ## Documentation
 

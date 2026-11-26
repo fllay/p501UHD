@@ -48,7 +48,7 @@ UHD's device model is an interface, not a protocol, so a new radio needs a modul
 | RX streamer | 32 libusb bulk transfers in flight, 56-byte header + payload per message; the header carries a sequence number, the hardware timestamp and overflow flags; the module reports overflows to UHD |
 | TX streamer | libusb bulk transfers of IQ with a timestamp per burst; the board plays a burst at its timestamp |
 | Time (`time_spec`) | hardware time from the PL block `p501_time`, read over the control channel and extrapolated with the host clock; timed RX start (`REQ_RX_START_AT`) and timed TX bursts |
-| Rates and formats | fixed 30.72 MS/s, `fc32` and `sc16` on the host, 12-bit on the AD9361 port (`otw_format: sc12` in the gNB config) |
+| Rates and formats | 7.68, 11.52, 15.36, 23.04 or 30.72 MS/s (`set_rx_rate`/`set_tx_rate` -> daemon `set_rate`, which re-runs the AD9361 bring-up), `fc32` and `sc16` on the host, 12-bit on the AD9361 port (`otw_format: sc12` in the gNB config) |
 
 What a USRP gives for free had to be built here:
 
@@ -64,7 +64,7 @@ What a USRP gives for free had to be built here:
   window of a licensed band. Most of the tuning in this project was this budget; see
   [`examples/ocudu_gnb/README.md`](examples/ocudu_gnb/README.md) lessons 8 and 9.
 
-Limits of the current module: one sample rate (30.72 MS/s, 2R2T), one LO frequency for all channels (a retune re-runs the
+Limits of the current module: 2R2T only (so at most 30.72 MS/s; 61.44 MS/s would need 1R1T mode), one LO frequency for all channels (a retune re-runs the
 AD9361 bring-up, about 1 s), no asynchronous underflow or late-burst messages to UHD.
 
 ## Repository layout
@@ -118,6 +118,11 @@ How the numbers moved: the uplink went from 5-6 to 12-15 Mbit/s when `rx_gain` w
 by the ADC, not the gain). The downlink went from 27 to 47 Mbit/s when the TX advance went from 6.5 to 3 ms and the OCUDU patch
 was dropped. 2x2 needed short TX messages and a different TX ring, see the example README.
 
+2x2 at 23.04 MS/s (`gnb_p501_2x2_n78_20mhz_2304.yaml`, `tx_gain` 82, `rx_gain` 40, `P501_RXMAXSAMPS=5760`, gNB threads
+pinned with `tools/pin_gnb.sh`), one phone: DL 78.9 Mbit/s (rank 2, MCS 27, 5% HARQ failures), UL 11.2 Mbit/s, no
+`PUxCH request late` warnings. At 30.72 MS/s the board's USB IN path is about 90% busy (a 256 KiB write takes 0.95 ms for
+1.07 ms of samples), so any stall left 10-15 ms of RX backlog; 23.04 MS/s gives it 30% headroom.
+
 ## Documentation
 
 - [`examples/ocudu_gnb/README.md`](examples/ocudu_gnb/README.md): setup, what each P501 setting means, lessons learned, 2x2.
@@ -132,7 +137,8 @@ was dropped. 2x2 needed short TX messages and a different TX ring, see the examp
 - [ ] Measure output power and spurious emissions; confirm `tx_gain` against a power meter or spectrum analyzer.
 - [ ] Automatic RX gain: OCUDU has none (`rx_gain` is fixed). Try the AD9361 slow or fast attack AGC, or a loop in `p501d` that sets the gain from the overload flag.
 - [ ] Per-channel LO and gain; retune without re-running the full bring-up (now about 1 s and streams must stop).
-- [ ] More sample rates and bandwidths (15.36, 23.04, 46.08 MS/s) and other bands; only 30.72 MS/s 2R2T is implemented.
+- [x] More sample rates: 7.68, 11.52, 15.36, 23.04 and 30.72 MS/s (2R2T). Only 23.04 and 30.72 are tested with phones; the LVDS delays were tuned at 30.72.
+- [ ] 1R1T mode for 61.44 MS/s (40 MHz cells) and other bands.
 - [ ] Check that the RF switch bits `rf_sw[2]` and `[3]` reach the TRX2 and RX2 switches in the `base_ts` bitstreams.
 
 **5G performance and stability**

@@ -66,7 +66,11 @@ interface that carries the IQ stream. The module talks to both.
   compensates with the same amount. This gives OCUDU the
   RX-to-TX processing time it needs, while the board plays each burst at its timestamp (timed TX in the
   `p501_time` PL block). Keep the two numbers equal and opposite.
-- `otw_format: sc12`, `srate: 30.72`: the AD9361 port is 12 bit; 20 MHz at 30 kHz SCS needs 30.72 MS/s.
+- `otw_format: sc12`, `srate: 30.72`: the AD9361 port is 12 bit. A 20 MHz cell at 30 kHz SCS also runs at `srate: 23.04`
+  (`gnb_p501_2x2_n78_20mhz_2304.yaml`), which the module supports along with 7.68, 11.52 and 15.36 MS/s. TX advance and
+  `time_alignment_calibration` are in samples, so scale them with the rate (3.5 ms = 107520 at 30.72, 80640 at 23.04).
+  At 23.04 MS/s set `P501_RXMAXSAMPS=5760`: with the default 65536-sample RX buffer (2.8 ms at this rate) the gNB logs
+  hundreds of `PUxCH request late` per second.
 - `tx_gain` is `89.75 - attenuation_dB`. `rx_gain` is the AD9361 gain table index (0-76).
 - `pdsch`/`pusch` OLLA keys: see "Lessons".
 

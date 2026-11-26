@@ -13,6 +13,8 @@
 #include <linux/usb/functionfs.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
 
 #define PAYLOAD (512 * 1024)
 #define RXP (256 * 1024)   /* RX message size (1.07 ms) */
@@ -127,6 +129,8 @@ static volatile uint32_t *adma, *ddma, *a9361;
 static char *rx_ring, *tx_ring;
 static uint64_t rx_phys, tx_phys; static size_t slot_bytes; static int nslots, tx_nslots;
 static int ep_in = -1, ep_out = -1;
+static double fs_hz = 30.72e6;
+static void read_fs(void) { FILE *f = fopen("/tmp/p501_fs", "r"); double v; if (f) { if (fscanf(f, "%lf", &v) == 1 && v > 1e6) fs_hz = v; fclose(f); } }
 static volatile int rx_run, rx_alive, tx_run, tx_alive;
 static struct { uint64_t rx_slots, rx_hwovf, rx_msgs, tx_filled, tx_submitted, tx_unf, tx_bad, tx_msgs; uint64_t pl_ts, pl_done, pl_late, pl_unf; } st;
 static volatile uint64_t tx_filled_v, tx_submitted_v;
@@ -159,29 +163,64 @@ static void *rx_thread(void *a)
 	a9361[0x88 / 4] = 4;                                          // clear sticky ADC overflow
 	if (tm) { tcmd(3, 0, 0); tcmd(4, 0, 1); tcmd(2, rx_timed_req ? rx_start_ts : 0, 0); }   // gate: timed start (0 = now)
 	adma[REG_CTRL / 4] = 1; uint64_t t0ts = 0; int t0ok = 0;
+	// RX USB writes go through FunctionFS AIO with up to rx_depth requests queued on the IN endpoint, so the endpoint never
+	// idles between messages (a blocking writev per message used ~0.95 ms of every 1.07 ms in 2x2: no headroom to catch up
+	// after a stall). A DMA slot is re-armed only once every write from it has completed.
+	int rx_depth = getenv("P501_RX_AIO") ? atoi(getenv("P501_RX_AIO")) : 4; if (rx_depth < 1) rx_depth = 1; if (rx_depth > 16) rx_depth = 16;
+	enum { Q = 64 };
+	static struct hdr hq[Q]; static struct iovec ivq[Q][2]; static struct iocb cbq[Q]; static uint64_t tendq[Q], tsubq[Q]; static uint8_t doneq[Q];
+	aio_context_t ctx = 0; if (syscall(SYS_io_setup, 32, &ctx)) { perror("io_setup rx"); goto out; }
+	uint64_t cdone = 0;                                               // messages whose USB write has completed (contiguous)
+	static int64_t dmx, wmx, amx, dsm, wsm, asm_; static int rn, wbig;
 	while (rx_run) {
 		while (nsub - nsend < (uint64_t)nslots) { if (submit(0, nsub % nslots) < 0) break; nsub++; }
-		if (cs < nsub * nch) {                                    // next message: complete once the DMA overwrote its sentinel
+		int progress = 0;
+		while (cs < nsub * nch && cs - cdone < (uint64_t)rx_depth) {      // queue every finished message, up to rx_depth in flight
 			uint64_t s = (cs / nch) % (uint64_t)nslots; size_t j = cs % nch;
 			char *base = rx_ring + (size_t)s * slot_bytes + j * rxp;
 			uint64_t *sp = (uint64_t *)(base + rxp - 64); civac(sp, 64);
-			if (sp[0] != SENT || sp[7] != SENT) {
-				civac(base, rxp);
-				if (tm && !t0ok) { t0ts = rx_first_ts(); t0ok = 1; }
-				uint32_t o = a9361[0x88 / 4];
-				if (o & 4) { a9361[0x88 / 4] = 4; if (cs > 0) { st.rx_hwovf++; flags |= HF_HWOVF; } if (cs > 0 && st.rx_hwovf <= 20) printf("HWOVF msg=%llu t=%.3f\n", (unsigned long long)cs, now() - t0); }
-				uint64_t sq = seq++; struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = sq, .payload_len = rxp, .flags = flags, .chunk = t0ts + sq * (uint64_t)(rxp / rx_fb), .slot_off = (uint32_t)(j * rxp) };
-				flags = 0;
-				struct iovec iov[2] = { { &h, sizeof h }, { base, rxp } };
-				if (writev(ep_in, iov, 2) < 0) { perror("writev ep1"); goto out; }
-				st.rx_msgs++; cs++;
-				if (cs % nch == 0) { nsend++; st.rx_slots++; }
-				continue;
-			}
+			if (sp[0] == SENT && sp[7] == SENT) break;
+			civac(base, rxp);
+			if (tm && !t0ok) { t0ts = rx_first_ts(); t0ok = 1; }
+			uint32_t o = a9361[0x88 / 4];
+			if (o & 4) { a9361[0x88 / 4] = 4; if (cs > 0) { st.rx_hwovf++; flags |= HF_HWOVF; } if (cs > 0 && st.rx_hwovf <= 20) printf("HWOVF msg=%llu t=%.3f\n", (unsigned long long)cs, now() - t0); }
+			int k = (int)(cs % Q); uint64_t sq = seq++;
+			hq[k] = (struct hdr){ .magic = 0x31303550, .hdr_len = sizeof(struct hdr), .seq = sq, .payload_len = rxp, .flags = flags, .chunk = t0ts + sq * (uint64_t)(rxp / rx_fb), .slot_off = (uint32_t)(j * rxp) };
+			flags = 0;
+			ivq[k][0] = (struct iovec){ &hq[k], sizeof(struct hdr) }; ivq[k][1] = (struct iovec){ base, rxp };
+			memset(&cbq[k], 0, sizeof cbq[k]);
+			cbq[k].aio_lio_opcode = IOCB_CMD_PWRITEV; cbq[k].aio_fildes = ep_in; cbq[k].aio_buf = (uintptr_t)ivq[k]; cbq[k].aio_nbytes = 2; cbq[k].aio_data = cs;
+			tendq[k] = hq[k].chunk + rxp / rx_fb; tsubq[k] = ts_now(); doneq[k] = 0;
+			{ int64_t d = (int64_t)tsubq[k] - (int64_t)tendq[k]; if (d > dmx) dmx = d; dsm += d; }
+			struct iocb *pc = &cbq[k];
+			if (syscall(SYS_io_submit, ctx, 1, &pc) != 1) { perror("io_submit rx"); goto out_aio; }
+			cs++; progress = 1;
 		}
-		usleep(50);
+		if (cs > cdone) {                                             // reap completions (wait briefly only if nothing else to do)
+			struct io_event ev[16]; struct timespec to = { 0, progress ? 0 : 200000 };
+			int ne = syscall(SYS_io_getevents, ctx, progress ? 0 : 1, 16, ev, &to);
+			if (ne < 0 && errno != EINTR) { perror("io_getevents rx"); goto out_aio; }
+			for (int i = 0; i < ne; i++) {
+				uint64_t m = ev[i].data; int k = (int)(m % Q);
+				if ((long long)ev[i].res < 0) { errno = -(int)ev[i].res; perror("rx aio write"); goto out_aio; }
+				doneq[k] = 1;
+				uint64_t tq1 = ts_now(); int64_t w = (int64_t)(tq1 - tsubq[k]), ag = (int64_t)tq1 - (int64_t)tendq[k];
+				if (w > wmx) wmx = w; if (ag > amx) amx = ag; wsm += w; asm_ += ag; if (w > (int64_t)(fs_hz * 4e-3)) wbig++;
+				if (++rn == 2000) { printf("RXSTAT aio%d n=%d det avg %.2f max %.2f | wr avg %.2f max %.2f (>4ms %d) | age avg %.2f max %.2f ms\n", rx_depth, rn, dsm / (fs_hz / 1e3) / rn, dmx / (fs_hz / 1e3), wsm / (fs_hz / 1e3) / rn, wmx / (fs_hz / 1e3), wbig, asm_ / (fs_hz / 1e3) / rn, amx / (fs_hz / 1e3)); fflush(stdout); rn = 0; dmx = wmx = amx = dsm = wsm = asm_ = 0; wbig = 0; }
+			}
+			while (cdone < cs && doneq[cdone % Q]) {
+				doneq[cdone % Q] = 0; cdone++; st.rx_msgs++;
+				if (cdone % nch == 0) { nsend++; st.rx_slots++; }
+			}
+			if (ne > 0 || progress) continue;
+		}
+		if (!progress) usleep(50);
 	}
+	syscall(SYS_io_destroy, ctx);
 	{ struct hdr h = { .magic = 0x31303550, .hdr_len = sizeof h, .seq = seq, .payload_len = 0, .flags = HF_END }; write(ep_in, &h, sizeof h); }
+	goto out;
+out_aio:
+	syscall(SYS_io_destroy, ctx);
 out:
 	adma[REG_CTRL / 4] = 0; tcmd(3, 0, 0); tcmd(4, 0, 0);
 	printf("rx stopped: %llu slots, hwovf %llu\n", (unsigned long long)st.rx_slots, (unsigned long long)st.rx_hwovf); fflush(stdout);
@@ -288,8 +327,11 @@ static int submit_tx(uint64_t msg, uint64_t bytes)
 // every following contiguous burst is late by the same amount and the PL never recovers (done freezes, late climbs).
 // Fix on the host side: (1) never hand the PL a burst that is already (nearly) due, (2) when the PL reports a discarded
 // burst, abort the DAC DMA, flush the PL descriptors and drop the queued bursts that are no longer playable.
-#define TX_MIN_LEAD 6144ULL      // ticks: a burst starting sooner than this cannot be fed in time (DMA latency)
-#define TX_RESYNC_LEAD 15360ULL  // ticks: after a resync only bursts starting later than this are kept
+// Tick limits are kept in time: p501d writes the sample rate to /tmp/p501_fs at every bring-up and the streams read it
+// when they start (ticks = 1/fs). TX_MIN_LEAD 0.2 ms: a burst starting sooner cannot be fed in time (DMA latency);
+// TX_RESYNC_LEAD 0.5 ms: after a resync only bursts starting later than this are kept.
+#define TX_MIN_LEAD ((uint64_t)(fs_hz * 0.2e-3))
+#define TX_RESYNC_LEAD ((uint64_t)(fs_hz * 0.5e-3))
 static uint64_t n_resync, n_drop;
 
 // Feeds the DAC DMAC with whatever contiguous messages are available (up to a slot per transfer). Playback starts once
@@ -370,10 +412,10 @@ tcmd(6, first_start, bytes / tx_fb);
 
 static void *watchdog(void *a) { sleep((unsigned)run_secs_g); printf("watchdog exit\n"); fflush(stdout); exit(0); return NULL; }
 
-static void start_rx(void) { pthread_t t; if (rx_alive || ep_in < 0) return; rx_alive = 1; rx_run = 1; pthread_create(&t, NULL, rx_thread, NULL); pthread_detach(t); }
+static void start_rx(void) { pthread_t t; if (rx_alive || ep_in < 0) return; read_fs(); rx_alive = 1; rx_run = 1; pthread_create(&t, NULL, rx_thread, NULL); pthread_detach(t); }
 static void start_tx(void)
 {
-	pthread_t t1, t2; if (tx_alive || ep_out < 0) return;
+	pthread_t t1, t2; if (tx_alive || ep_out < 0) return; read_fs();
 	tx_ring_msgs = tx_nslots * (int)(slot_bytes / txp);
 	memset(h_lead_rd, 0, sizeof h_lead_rd); memset(h_lead_wr, 0, sizeof h_lead_wr); memset(h_lat, 0, sizeof h_lat); memset(h_gap, 0, sizeof h_gap); h_n_neg_rd = h_n_neg_wr = 0; memset(&st.tx_filled, 0, 5 * sizeof(uint64_t)); tx_filled_v = tx_submitted_v = tx_released_v = 0; tx_last_fill = now(); tx_next_ts = 0; dbg_d = 0; dbg_r = 0; tcmd(5, 0, tx_timed_mode ? 1 : 0);
 	tx_rd_v = 0; tx_alive = 3; tx_run = 1; pthread_create(&t1, NULL, tx_reader, NULL); pthread_detach(t1); pthread_create(&t2, NULL, tx_submitter, NULL); pthread_detach(t2); pthread_t t3; pthread_create(&t3, NULL, tx_flusher, NULL); pthread_detach(t3);

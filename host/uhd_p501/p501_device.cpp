@@ -6,7 +6,7 @@
 //             frames {I1,Q1,I2,Q2} int16 (kernel/ffs/p501_stream_wd.c); RX messages are 32768 frames, TX messages 16384 (2 ch)
 //   time    : hardware time from the PL block p501_time (bitstreams base_ts*): timed RX start and timed TX bursts; with the
 //             plain base bitstream the host clock is used and timed commands are ignored
-//   limits  : one rate (30.72 MS/s 2R2T), one LO frequency for all channels
+//   rates   : 7.68, 11.52, 15.36, 23.04, 30.72 MS/s (2R2T), set with set_rx_rate/set_tx_rate before streaming; one LO for all channels
 //
 #include <libusb-1.0/libusb.h>
 #include <arpa/inet.h>
@@ -48,7 +48,10 @@ namespace p501 {
 static const uint16_t USB_VID = 0x1209, USB_PID = 0x0002;
 static const char* DEFAULT_ADDR = "192.168.2.1";
 static const int DEFAULT_PORT   = 5555;
-static const double FS          = 30.72e6;
+// Sample rate = hardware tick rate (one PL time tick per sample). Read from the daemon ('info fs=') and changed with
+// set_rx_rate/set_tx_rate/set_master_clock_rate to one of the daemon's 'rates=' (streams must be stopped).
+static double FS = 30.72e6;
+static std::vector<double> g_rates{30.72e6};
 // TX timestamp advance (samples): lets the gNB use stock time_alignment_calibration (<0) to gain RX->TX processing delay;
 // the driver removes the same shift before transmitting. Set with device_args tx_advance_samples=N.
 static long long g_tx_adv = 0;
@@ -356,7 +359,13 @@ public:
     ~rx_streamer_impl() override { shutdown(); }
 
     size_t get_num_channels() const override { return _chans.size(); }
-    size_t get_max_num_samps() const override { return FRAMES; }
+    // The gNB sizes its baseband RX buffer from this value (single_packet policy), so it also sets how long UL samples
+    // wait before they are demodulated. P501_RXMAXSAMPS (frames) overrides the 65536 default for experiments.
+    size_t get_max_num_samps() const override
+    {
+        static const size_t v = getenv("P501_RXMAXSAMPS") ? (size_t)atoi(getenv("P501_RXMAXSAMPS")) : FRAMES;
+        return v ? v : FRAMES;
+    }
     const std::vector<size_t>& chans() const { return _chans; }
 
     void shutdown()
@@ -524,7 +533,7 @@ private:
     // The RX ring on the board is a FIFO: a consumer that was late to start stays that far behind real time for good, and a
     // timed TX (scheduled from RX timestamps) then misses every deadline. Messages older than LAG_MAX are dropped
     // (reported as one overflow) so the stream is brought back to real time.
-    static long long lag_max() { static long long v = getenv("P501_LAG_MAX") ? atoll(getenv("P501_LAG_MAX")) : 2457600; return v; }
+    static long long lag_max() { return getenv("P501_LAG_MAX") ? atoll(getenv("P501_LAG_MAX")) : (long long)(0.08 * FS); } // 80 ms
     bool next_msg(double timeout)
     {
         const double tend = steady_s() + timeout;
@@ -537,7 +546,7 @@ private:
             if (getenv("P501_RXLAGSTAT")) {
                 static long long lmin = 1LL << 60, lmax = -(1LL << 60), lsum = 0; static int ln = 0;
                 lmin = std::min(lmin, lag); lmax = std::max(lmax, lag); lsum += lag;
-                if (++ln == 2000) { fprintf(stderr, "RXLAGSTAT n=%d min %.2f avg %.2f max %.2f ms\n", ln, lmin / 30720.0, lsum / 30720.0 / ln, lmax / 30720.0); lmin = 1LL << 60; lmax = -(1LL << 60); lsum = 0; ln = 0; }
+                if (++ln == 2000) { fprintf(stderr, "RXLAGSTAT n=%d min %.2f avg %.2f max %.2f ms\n", ln, lmin / (FS / 1e3), lsum / (FS / 1e3) / ln, lmax / (FS / 1e3)); lmin = 1LL << 60; lmax = -(1LL << 60); lsum = 0; ln = 0; }
             }
             if (getenv("P501_DEBUG_RX")) { static long long mx = 0; static int cnt = 0; if (lag > 122880 && cnt++ < 400) fprintf(stderr, "RXLAG %lld ticks (%.2f ms) seq=%llu\n", lag, lag / 30720.0, (unsigned long long)_next_seq); (void)mx; }
             if (lag <= lag_max())
@@ -973,9 +982,18 @@ public:
         _sh = std::make_shared<shared_t>();
         _sh->ctrl.reset(new ctrl_t(args.get("addr", DEFAULT_ADDR), DEFAULT_PORT, 3.0));
         _info = _sh->ctrl->call("info");
-        for (auto& t : _info)
+        for (auto& t : _info) {
             if (t == "time=1")
                 _sh->hw_time = true;
+            if (t.rfind("fs=", 0) == 0)
+                FS = std::stod(t.substr(3));
+            if (t.rfind("rates=", 0) == 0) {
+                g_rates.clear();
+                std::stringstream ss(t.substr(6));
+                for (std::string v; std::getline(ss, v, ',');)
+                    g_rates.push_back(std::stod(v));
+            }
+        }
         _build_tree();
     }
     ~p501_device() override
@@ -1016,6 +1034,29 @@ private:
 
     std::shared_ptr<shared_t> _sh;
     std::vector<std::string> _info;
+    // Changes the board's sample rate (= tick rate) to the nearest one the daemon supports. The daemon re-runs the AD9361
+    // bring-up (a few seconds), so this belongs before the streams are created, as UHD applications do.
+    double _set_rate(double r)
+    {
+        double best = g_rates.front();
+        for (double v : g_rates)
+            if (std::abs(v - r) < std::abs(best - r))
+                best = v;
+        if (std::abs(best - r) > 1.0)
+            LOGW("sample rate " << r / 1e6 << " MS/s is not supported; using " << best / 1e6 << " MS/s");
+        if (std::abs(best - FS) > 1.0) {
+            if (_rx.lock() || _tx.lock())
+                LOGW("changing the sample rate while streamers exist");
+            const auto rep = _sh->ctrl->call("set_rate " + std::to_string((long long)std::llround(best)));
+            FS = std::stod(rep.at(0));
+            {
+                std::lock_guard<std::mutex> l(_sh->tm);
+                _sh->tm_host = -1.0; // re-read the PL time at the new tick rate
+            }
+            UHD_LOG_INFO("P501", "sample rate set to " << FS / 1e6 << " MS/s");
+        }
+        return FS;
+    }
     std::mutex _m;
     std::weak_ptr<rx_streamer_impl> _rx;
     std::weak_ptr<tx_streamer_impl> _tx;
@@ -1043,11 +1084,7 @@ void p501_device::_build_tree()
     _tree->create<std::string>(mb / "fpga_version").set("base_dmac32");
     _tree->create<std::string>(mb / "fw_version").set("p501d " + (_info.size() > 1 ? _info[1] : std::string("?")));
     _tree->create<double>(mb / "tick_rate")
-        .set_coercer([](double r) {
-            if (std::abs(r - FS) > 1.0)
-                LOGW("master clock rate is fixed at 30.72 MHz; ignoring " << r / 1e6 << " MHz");
-            return FS;
-        })
+        .set_coercer([this](double r) { return _set_rate(r); })
         .set_publisher([] { return FS; });
     _tree->create<double>(mb / "link_max_rate").set(500e6);
 
@@ -1116,13 +1153,14 @@ void p501_device::_build_chan(bool rx, size_t ch)
     const fs_path fe      = mb / "dboards/A" / (dir + "_frontends") / c;
 
     // ---- DSP: a fixed rate, no DDC/DUC
-    _tree->create<meta_range_t>(dsp / "rate/range").set(meta_range_t(FS, FS));
+    {
+        meta_range_t rr;
+        for (double v : g_rates)
+            rr.push_back(range_t(v));
+        _tree->create<meta_range_t>(dsp / "rate/range").set(rr);
+    }
     _tree->create<double>(dsp / "rate/value")
-        .set_coercer([](double r) {
-            if (std::abs(r - FS) > 1.0)
-                LOGW("sample rate is fixed at 30.72 MS/s (2R2T); requested " << r / 1e6 << " MS/s ignored");
-            return FS;
-        })
+        .set_coercer([this](double r) { return _set_rate(r); })
         .set_publisher([] { return FS; });
     _tree->create<meta_range_t>(dsp / "freq/range").set(meta_range_t(0.0, 0.0));
     _tree->create<double>(dsp / "freq/value").set_coercer([](double) { return 0.0; }).set(0.0);
@@ -1163,8 +1201,8 @@ void p501_device::_build_chan(bool rx, size_t ch)
         _tree->create<double>(l / "freq/value").set_coercer(set_rf).set_publisher(get_rf);
         _tree->create<meta_range_t>(l / "freq/range").set(frange);
     }
-    _tree->create<double>(fe / "bandwidth/value").set_coercer([](double) { return FS; }).set(FS);
-    _tree->create<meta_range_t>(fe / "bandwidth/range").set(meta_range_t(FS, FS));
+    _tree->create<double>(fe / "bandwidth/value").set_coercer([](double) { return FS; }).set_publisher([] { return FS; });
+    _tree->create<meta_range_t>(fe / "bandwidth/range").set(meta_range_t(g_rates.front(), g_rates.back()));
 
     // ---- gain
     auto gr = ctrl->call("get_" + dir + "_gain_range " + c);

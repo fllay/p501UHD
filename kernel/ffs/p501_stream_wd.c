@@ -1,6 +1,7 @@
 // Board side: FunctionFS bulk source (EP IN) + sink (EP OUT) for USB3 throughput tests.
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -154,6 +155,39 @@ static int submit(int is_tx, int slot)
 	return 0;
 }
 
+
+// RX level meter for the AGC in p501d. Every 4th frame of every RX message is binned by its hardware time into 0.5 ms
+// slots of a TDD period (P501_TDD_PERIOD_MS, default 5 ms = 10 slots at 30 kHz SCS; slot 0 starts at tick 0 mod the
+// period). Per slot of the period: mean power over both channels (dBFS, full scale 2047) and the clipped-sample count
+// (|x| >= 2000). DC is removed (power = variance). Every ~200 ms /tmp/p501_rxlvl gets "<seq> <nslots> <dBFS slot0..> | <clip slot0..> | <samples per slot>".
+// The DL slots carry the board's own TX leakage, so the AGC looks at the UL slots only.
+static void rx_level(const char *base, size_t bytes, uint64_t ts0)
+{
+	enum { MAXS = 40 };
+	static double acc[MAXS], sm[MAXS][4]; static uint64_t clip[MAXS], cnt[MAXS], wseq; static double tlast; static int nper = -1; static uint64_t slot_t;
+	if (nper < 0) { const char *e = getenv("P501_TDD_PERIOD_MS"); double pm = e ? atof(e) : 5.0; slot_t = (uint64_t)(fs_hz * 0.5e-3); nper = (int)(pm / 0.5 + 0.5); if (nper < 1 || nper > MAXS) nper = 10; }
+	const int nv = 2 * (rx_fb / 4);
+	const int16_t *x = (const int16_t *)base; const size_t n = bytes / rx_fb;
+	for (size_t i = 0; i < n; i += 4) {
+		const int k = (int)(((ts0 + i) / slot_t) % (uint64_t)nper);
+		const int16_t *f = x + i * nv; double a2 = 0; int cl = 0;
+		for (int c = 0; c < nv; c++) { int v = f[c]; a2 += (double)v * v; cl += (v >= 2000 || v <= -2000); sm[k][c] += v; }
+		acc[k] += a2; clip[k] += cl; cnt[k] += nv;
+	}
+	double t = now();
+	if (t - tlast >= 0.2) {
+		FILE *fo = fopen("/tmp/p501_rxlvl.tmp", "w");
+		if (fo) {
+			fprintf(fo, "%llu %d", (unsigned long long)++wseq, nper);
+			for (int k = 0; k < nper; k++) { double v = -120.0; if (cnt[k]) { double per = (double)cnt[k] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += sm[k][c] * sm[k][c] / per; v = 10 * log10((acc[k] - dc) / cnt[k] / (2047.0 * 2047.0) + 1e-12); } fprintf(fo, " %.1f", v); }
+			fprintf(fo, " | dc"); for (int k = 0; k < nper && k < 1; k++) { double per = (double)cnt[k] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += sm[k][c] * sm[k][c] / per; fprintf(fo, " %.1f", cnt[k] ? 10 * log10(dc / cnt[k] / (2047.0 * 2047.0) + 1e-12) : -120.0); }
+			fprintf(fo, " |"); for (int k = 0; k < nper; k++) fprintf(fo, " %llu", (unsigned long long)clip[k]);
+			fprintf(fo, " | %llu\n", (unsigned long long)(cnt[0]));
+			fclose(fo); rename("/tmp/p501_rxlvl.tmp", "/tmp/p501_rxlvl");
+		}
+		tlast = t; memset(acc, 0, sizeof acc); memset(sm, 0, sizeof sm); memset(clip, 0, sizeof clip); memset(cnt, 0, sizeof cnt);
+	}
+}
 static volatile uint64_t rx_start_ts; static volatile int rx_timed_req;
 static void *rx_thread(void *a)
 {
@@ -186,6 +220,7 @@ static void *rx_thread(void *a)
 			if (o & 4) { a9361[0x88 / 4] = 4; if (cs > 0) { st.rx_hwovf++; flags |= HF_HWOVF; } if (cs > 0 && st.rx_hwovf <= 20) printf("HWOVF msg=%llu t=%.3f\n", (unsigned long long)cs, now() - t0); }
 			int k = (int)(cs % Q); uint64_t sq = seq++;
 			hq[k] = (struct hdr){ .magic = 0x31303550, .hdr_len = sizeof(struct hdr), .seq = sq, .payload_len = rxp, .flags = flags, .chunk = t0ts + sq * (uint64_t)(rxp / rx_fb), .slot_off = (uint32_t)(j * rxp) };
+			rx_level(base, rxp, hq[k].chunk);
 			flags = 0;
 			ivq[k][0] = (struct iovec){ &hq[k], sizeof(struct hdr) }; ivq[k][1] = (struct iovec){ base, rxp };
 			memset(&cbq[k], 0, sizeof cbq[k]);

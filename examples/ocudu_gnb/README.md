@@ -71,7 +71,11 @@ interface that carries the IQ stream. The module talks to both.
   `time_alignment_calibration` are in samples, so scale them with the rate (3.5 ms = 107520 at 30.72, 80640 at 23.04).
   At 23.04 MS/s set `P501_RXMAXSAMPS=5760`: with the default 65536-sample RX buffer (2.8 ms at this rate) the gNB logs
   hundreds of `PUxCH request late` per second.
-- `tx_gain` is `89.75 - attenuation_dB`. `rx_gain` is the AD9361 gain table index (0-76).
+- `tx_gain` is `89.75 - attenuation_dB`. `rx_gain` is the AD9361 gain table index (0-76). With the board AGC on
+  (`P501_AGC=1`, the default in `tools/board_restart_p501d.sh`) `rx_gain` is only the starting value: `p501d` moves it
+  to put the uplink slots near -17 dBFS (`P501_AGC_TARGET`). The downlink slots are ignored because the board's own TX
+  leaks into its RX there, close to full scale at `tx_gain` 82. `tools/p501_ctl.py agc` shows the state and `agc 0`
+  switches it off. Without the AGC, `rx_gain` 25 was right with the phones next to the antennas and 50 a few metres away.
 - `pdsch`/`pusch` OLLA keys: see "Lessons".
 
 ## Lessons from getting this to work
@@ -139,7 +143,7 @@ What 2x2 needs on top of the 1x1 setup (all in this repository):
 
 - **TX advance 3.5 ms** (`tx_advance_samples=107520`, `time_alignment_calibration: -107520`). At 3 ms about 8% of the TX bursts arrive too late and RARs are
   missed; at 4 ms the RAR window is missed (7 RAR failures in the first minutes).
-- **Board `p501_stream` built from `kernel/ffs/p501_stream_wd.c`** (`gcc -O2 -pthread -o p501_stream p501_stream_wd.c`): the TX USB reader uses FunctionFS AIO with
+- **Board `p501_stream` built from `kernel/ffs/p501_stream_wd.c`** (`gcc -O2 -pthread -o p501_stream p501_stream_wd.c -lm`): the TX USB reader uses FunctionFS AIO with
   6 requests queued, the cache flush runs in its own thread, and the threads are pinned (RX thread CPU3 priority 80, TX reader and flusher CPU2, submitter CPU1;
   CPU0 is left to the USB interrupt thread).
 - **`P501_TXP_KIB=128` and the USB IRQ thread at priority 90** on the board (`tools/board_restart_p501d.sh` does both; install it on the board as `/home/xilinx/restart3.sh`, which `tools/full_restart_gnb.sh` calls).

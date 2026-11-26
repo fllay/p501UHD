@@ -8,6 +8,7 @@ Protocol: one request per line, 'cmd arg...'; reply 'OK <tokens>' or 'ERR <messa
   get_rx_gain|get_tx_gain c -> OK <dB>            set_rx_gain|set_tx_gain c <dB> -> OK <actual dB>
   get_*_gain_range c        -> OK <min> <max> <step>
   lo_locked                 -> OK 1|0
+  agc [0|1]                 -> OK <on> <gain> <ul_dBFS>   (state, or switch the RX AGC off/on)
   get_rate                  -> OK <Hz>            set_rate <Hz> -> OK <actual Hz>  (streams stopped; re-runs the bring-up)
   loopback 0|1              -> OK <0|1>   (AD9361 digital loopback TX->RX, a test aid)
   quit
@@ -82,6 +83,69 @@ RX_GAIN_MAX, TX_GAIN_MAX = 76.0, 89.75
 LO_MIN, LO_MAX = 70e6, 6000e6
 
 
+class Agc:
+    """Slow RX AGC driven by the uplink slots only.
+
+    p501_stream writes /tmp/p501_rxlvl about every 200 ms: the RX power (dBFS, DC removed) and the clipped-sample count
+    for each 0.5 ms slot of the TDD period, binned by hardware time. The DL slots carry the board's own TX leakage (often
+    close to full scale), so only the UL slots (P501_AGC_UL_SLOTS, default 7,8,9 for the 5 ms DDDDDDSUUU pattern) count.
+    Once a second: if the UL slots clip or exceed target+4 dB, the gain drops by 3 dB; if a phone is transmitting
+    (UL level at least 8 dB above the noise floor) and the level is below target-5 dB, the gain rises by 1 dB (2 dB
+    below target-10), at most every 2 s. The noise floor is tracked relative to the gain (the lowest UL level minus the
+    gain seen so far, creeping up 0.02 dB per report), so it stays valid while traffic runs and after gain changes. The gain never leaves [P501_AGC_MIN, P501_AGC_MAX]. Both RX channels get the same gain."""
+
+    def __init__(self, board):
+        e = os.environ.get
+        self.b = board
+        self.on = e("P501_AGC", "0") == "1"
+        self.target = float(e("P501_AGC_TARGET", "-17"))
+        self.gmin, self.gmax = float(e("P501_AGC_MIN", "20")), float(e("P501_AGC_MAX", "65"))
+        self.ul = [int(x) for x in e("P501_AGC_UL_SLOTS", "7,8,9").split(",")]
+        self.level, self.floor, self.floor_rel, self.last_up, self.hist = None, None, None, 0.0, []
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def read(self):
+        try:
+            parts = open("/tmp/p501_rxlvl").read().split("|")        # "<seq> <n> <dBFS>... | dc <dBFS> | <clips>... | <samples>"
+            t = parts[0].split(); n = int(t[1]); lv = [float(x) for x in t[2:2 + n]]
+            clip = [int(x) for x in parts[2].split()[:n]]
+            return int(t[0]), max(lv[k] for k in self.ul), sum(clip[k] for k in self.ul)
+        except Exception:
+            return None
+
+    def run(self):
+        seq, t_dec = None, 0.0
+        while True:
+            time.sleep(0.2)
+            r = self.read()
+            if not r or r[0] == seq:
+                continue
+            seq = r[0]
+            self.hist = (self.hist + [r])[-50:]                        # last ~10 s
+            rel = r[1] - self.b.rx_gain[0]
+            self.floor_rel = rel if self.floor_rel is None else min(rel, self.floor_rel + 0.02)
+            self.floor = self.floor_rel + self.b.rx_gain[0]
+            now_ = time.time()
+            if now_ - t_dec < 1.0 or len(self.hist) < 5:
+                continue
+            t_dec = now_
+            win = self.hist[-5:]                                       # last second
+            self.level = max(h[1] for h in win); clips = sum(h[2] for h in win)
+            if not self.on:
+                continue
+            g = self.b.rx_gain[0]
+            if clips > 50 or self.level > self.target + 4:
+                ng = max(self.gmin, g - 3)
+            elif self.level < self.target - 5 and self.level > self.floor + 8 and now_ - self.last_up > 2.0:
+                ng = min(self.gmax, g + (2 if self.level < self.target - 10 else 1)); self.last_up = now_
+            else:
+                continue
+            if ng != g:
+                self.b.set_gain_all(ng)
+                self.hist = []                                         # judge the new gain on fresh data
+                print(f"AGC rx_gain {g:.0f} -> {ng:.0f} (UL {self.level:.1f} dBFS, clipped {clips}, floor {self.floor:.1f})", flush=True)
+
+
 class Board:
     def __init__(self):
         self.lock = threading.RLock()
@@ -102,6 +166,12 @@ class Board:
              str(SLOT_BYTES), str(NSLOTS), hex(o["axi_ad9361_adc_dma"]["phys_addr"]), "0",
              hex(o["axi_ad9361"]["phys_addr"]), hex(self.txring.physical_address),
              hex(o["axi_ad9361_dac_dma"]["phys_addr"]), str(TX_NSLOTS)] + ([hex(TIME_PHYS)] if TIME_PHYS else []))
+
+    def set_gain_all(self, g):
+        with self.lock:
+            g = float(min(RX_GAIN_MAX, max(0.0, round(g))))
+            self.rx_gain = [g, g]
+            self.ad.set_rx_manual_gain(int(g), channels=(1, 2))
 
     def apply(self):
         for i in (0, 1):
@@ -139,6 +209,11 @@ class Board:
         if c == "info":
             return (f"OK p501 {VERSION} fs={self.fs} rx=2 tx=2 time={1 if TIME_PHYS else 0} serial=P501-{os.uname().nodename}"
                     f" rates={','.join(str(r) for r in sorted(RATE_BW))}")
+        if c == "agc":
+            if len(t) > 1:
+                self.agc.on = t[1] == "1"
+            lv = "nan" if self.agc.level is None else f"{self.agc.level:.1f}"
+            return f"OK {int(self.agc.on)} {self.rx_gain[0]} {lv}"
         if c == "get_rate":
             return f"OK {self.fs}"
         if c == "set_rate":
@@ -207,5 +282,6 @@ def serve(board):
 if __name__ == "__main__":
     b = Board()
     b.start_streamer()
+    b.agc = Agc(b)
     threading.Thread(target=lambda: (time.sleep(1.0), None), daemon=True).start()
     serve(b)

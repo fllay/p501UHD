@@ -135,7 +135,8 @@ pinned with `tools/pin_gnb.sh`), one phone: DL 78.9 Mbit/s (rank 2, MCS 27, 5% H
 **RF and radio**
 - [ ] Frequency accuracy: phones only sync with a 10 MHz reference on REF IN (without it the carrier is about 10 ppm off); add the external clock option to the module and the gNB config, and document the reference setup.
 - [ ] Measure output power and spurious emissions; confirm `tx_gain` against a power meter or spectrum analyzer.
-- [ ] Automatic RX gain: OCUDU has none (`rx_gain` is fixed). Try the AD9361 slow or fast attack AGC, or a loop in `p501d` that sets the gain from the overload flag.
+- [x] Automatic RX gain: a slow loop in `p501d` (`P501_AGC=1`, on in `board_restart_p501d.sh`) driven by the streamer's per-slot level meter, uplink slots only. From `rx_gain` 35 it reached 43 in about 20 s and from 62 it dropped to 44 in about 6 s; one phone then ran 12 Mbit/s UL.
+- [ ] AGC: detect the UL slots from the gNB's TDD pattern instead of `P501_AGC_UL_SLOTS` (7,8,9 for the default 5 ms DDDDDDSUUU), and tune the target per phone count.
 - [ ] Per-channel LO and gain; retune without re-running the full bring-up (now about 1 s and streams must stop).
 - [x] More sample rates: 7.68, 11.52, 15.36, 23.04 and 30.72 MS/s (2R2T). Only 23.04 and 30.72 are tested with phones; the LVDS delays were tuned at 30.72.
 - [ ] 1R1T mode for 61.44 MS/s (40 MHz cells) and other bands.
@@ -161,7 +162,7 @@ pinned with `tools/pin_gnb.sh`), one phone: DL 78.9 Mbit/s (rank 2, MCS 27, 5% H
 **Core network and tooling**
 - [ ] Open5GS AMF assertion bug: the container exits with code 139 and `core_watchdog.sh` only restarts it.
 - [ ] Clean the repository: drop the Vivado simulation leftovers in `hdl_ts/`, remove the `.pre_rfsw` bitstream backups, add a `LICENSE` and a `.gitignore`.
-- [ ] Add a script that builds and deploys the board streamer (`gcc -O2 -pthread -o p501_stream p501_stream_wd.c`), the way `deploy_to_board.sh` does for the notebooks.
+- [ ] Add a script that builds and deploys the board streamer (`gcc -O2 -pthread -o p501_stream p501_stream_wd.c -lm`), the way `deploy_to_board.sh` does for the notebooks.
 
 ## Credits
 

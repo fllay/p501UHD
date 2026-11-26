@@ -13,6 +13,8 @@ export P501_TRACKING=1   # AD9361 RX DC-offset + quadrature tracking (off by def
 # TX slot size in KiB: must be >= the host's TX message (uhd_p501 sends 128 KiB). The TX ring holds 8 x 4 MiB / slot messages, so a
 # short slot buys more TX buffering in time (1 slot = 0.53 ms of 2-channel samples at 128 KiB); a 512 KiB slot gave only 34 ms for short messages
 export P501_TXP_KIB=${P501_TXP_KIB:-128}
+# RX AGC in p501d (uplink slots only; P501_AGC_TARGET, _MIN, _MAX, _UL_SLOTS): 0 keeps the gain the UHD program sets
+export P501_AGC=${P501_AGC:-1}
 bash /home/xilinx/p501UHD/kernel/ffs/p501d_start.sh
 # the USB (dwc3) interrupt thread runs at RT priority 50 on CPU0, below the streamer threads: raise it
 sleep 4

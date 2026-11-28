@@ -88,8 +88,8 @@ interface that carries the IQ stream. The module talks to both.
    not change with gain. It lands on the DC subcarrier (PRB 25 of 51). Every full-band PUSCH grant contains that
    PRB, so the SINR estimate fell to about -10 dB and the scheduler stayed at MCS 0-2 (about 1 Mbit/s uplink).
    Grants without that PRB reported +12 to +21 dB. Fix: `rx_streamer_impl::convert()` subtracts a slow (~75 Hz)
-   running mean per channel (`P501_NO_DCBLOCK=1` disables it) and the board enables the AD9361 RX DC and quadrature
-   tracking (`P501_TRACKING=1`, set by `board_restart_p501d.sh`). Use `tools/pusch_by_prb.py` on a gNB log written
+   running mean per channel (`P501_NO_DCBLOCK=1` disables it). (`board_restart_p501d.sh` used to set `P501_TRACKING=1`
+   for the AD9361 RX DC and quadrature tracking, but the Python daemon never applied it; the C daemon does on request.) Use `tools/pusch_by_prb.py` on a gNB log written
    with `log: phy_level: info` to see the effect per allocation.
 3. **`rx_gain` decides the uplink.** The receiver has a conversion noise floor that does not scale with gain, and a phone
    at its maximum power gives a low SINR when the gain is low. Sweeping the gain live (`set_rx_gain 0 <n>` on the board's

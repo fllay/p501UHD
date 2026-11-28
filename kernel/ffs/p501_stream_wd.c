@@ -156,38 +156,49 @@ static int submit(int is_tx, int slot)
 }
 
 
-// RX level meter for the AGC in p501d. Every 4th frame of every RX message is binned by its hardware time into 0.5 ms
+// RX level meter for the AGC in p501d. Every 16th frame of every RX message is binned by its hardware time into 0.5 ms
 // slots of a TDD period (P501_TDD_PERIOD_MS, default 5 ms = 10 slots at 30 kHz SCS; slot 0 starts at tick 0 mod the
 // period). Per slot of the period: mean power over both channels (dBFS, full scale 2047) and the clipped-sample count
 // (|x| >= 2000). DC is removed (power = variance). Every ~200 ms /tmp/p501_rxlvl gets "<seq> <nslots> <dBFS slot0..> | <clip slot0..> | <samples per slot>".
 // The DL slots carry the board's own TX leakage, so the AGC looks at the UL slots only.
 static void rx_level(const char *base, size_t bytes, uint64_t ts0)
 {
-	enum { MAXS = 40 };
-	static double acc[MAXS], sm[MAXS][4]; static uint64_t clip[MAXS], cnt[MAXS], wseq; static double tlast; static int nper = -1; static uint64_t slot_t;
+	// Cheap: one frame in RXLVL_STEP (16), integer accumulators, and the slot index computed once per run of frames
+	// that falls into one slot (a 64-bit division per frame cost the RX thread most of a core).
+	enum { MAXS = 40, RXLVL_STEP = 16 };
+	static int64_t acc[MAXS], sm[MAXS][4]; static uint64_t clip[MAXS], cnt[MAXS], wseq; static double tlast; static int nper = -1; static uint64_t slot_t;
 	if (nper < 0) { const char *e = getenv("P501_TDD_PERIOD_MS"); double pm = e ? atof(e) : 5.0; slot_t = (uint64_t)(fs_hz * 0.5e-3); nper = (int)(pm / 0.5 + 0.5); if (nper < 1 || nper > MAXS) nper = 10; }
 	const int nv = 2 * (rx_fb / 4);
 	const int16_t *x = (const int16_t *)base; const size_t n = bytes / rx_fb;
-	for (size_t i = 0; i < n; i += 4) {
-		const int k = (int)(((ts0 + i) / slot_t) % (uint64_t)nper);
-		const int16_t *f = x + i * nv; double a2 = 0; int cl = 0;
-		for (int c = 0; c < nv; c++) { int v = f[c]; a2 += (double)v * v; cl += (v >= 2000 || v <= -2000); sm[k][c] += v; }
-		acc[k] += a2; clip[k] += cl; cnt[k] += nv;
+	uint64_t t = ts0; size_t i = 0;
+	while (i < n) {
+		const uint64_t sidx = t / slot_t; const int k = (int)(sidx % (uint64_t)nper);
+		size_t run = (size_t)((sidx + 1) * slot_t - t); if (run > n - i) run = n - i;
+		int64_t a2 = 0, s0 = 0, s1 = 0, s2 = 0, s3 = 0; uint64_t cl = 0, m = 0;
+		const size_t j0 = (i + RXLVL_STEP - 1) / RXLVL_STEP * RXLVL_STEP;   // keep the subsampling grid fixed
+		for (size_t j = j0; j < i + run; j += RXLVL_STEP) {
+			const int16_t *f = x + j * nv; m++;
+			int v0 = f[0], v1 = f[1]; a2 += v0 * v0 + v1 * v1; s0 += v0; s1 += v1; cl += (v0 >= 2000 || v0 <= -2000) + (v1 >= 2000 || v1 <= -2000);
+			if (nv == 4) { int v2 = f[2], v3 = f[3]; a2 += v2 * v2 + v3 * v3; s2 += v2; s3 += v3; cl += (v2 >= 2000 || v2 <= -2000) + (v3 >= 2000 || v3 <= -2000); }
+		}
+		acc[k] += a2; sm[k][0] += s0; sm[k][1] += s1; sm[k][2] += s2; sm[k][3] += s3; clip[k] += cl; cnt[k] += m * nv;
+		i += run; t += run;
 	}
-	double t = now();
-	if (t - tlast >= 0.2) {
+	double tn = now();
+	if (tn - tlast >= 0.2) {
 		FILE *fo = fopen("/tmp/p501_rxlvl.tmp", "w");
 		if (fo) {
 			fprintf(fo, "%llu %d", (unsigned long long)++wseq, nper);
-			for (int k = 0; k < nper; k++) { double v = -120.0; if (cnt[k]) { double per = (double)cnt[k] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += sm[k][c] * sm[k][c] / per; v = 10 * log10((acc[k] - dc) / cnt[k] / (2047.0 * 2047.0) + 1e-12); } fprintf(fo, " %.1f", v); }
-			fprintf(fo, " | dc"); for (int k = 0; k < nper && k < 1; k++) { double per = (double)cnt[k] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += sm[k][c] * sm[k][c] / per; fprintf(fo, " %.1f", cnt[k] ? 10 * log10(dc / cnt[k] / (2047.0 * 2047.0) + 1e-12) : -120.0); }
+			for (int k = 0; k < nper; k++) { double v = -120.0; if (cnt[k]) { double per = (double)cnt[k] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += (double)sm[k][c] * sm[k][c] / per; v = 10 * log10(((double)acc[k] - dc) / cnt[k] / (2047.0 * 2047.0) + 1e-12); } fprintf(fo, " %.1f", v); }
+			fprintf(fo, " | dc"); { double per = (double)cnt[0] / nv, dc = 0; for (int c = 0; c < nv; c++) dc += cnt[0] ? (double)sm[0][c] * sm[0][c] / per : 0; fprintf(fo, " %.1f", cnt[0] ? 10 * log10(dc / cnt[0] / (2047.0 * 2047.0) + 1e-12) : -120.0); }
 			fprintf(fo, " |"); for (int k = 0; k < nper; k++) fprintf(fo, " %llu", (unsigned long long)clip[k]);
 			fprintf(fo, " | %llu\n", (unsigned long long)(cnt[0]));
 			fclose(fo); rename("/tmp/p501_rxlvl.tmp", "/tmp/p501_rxlvl");
 		}
-		tlast = t; memset(acc, 0, sizeof acc); memset(sm, 0, sizeof sm); memset(clip, 0, sizeof clip); memset(cnt, 0, sizeof cnt);
+		tlast = tn; memset(acc, 0, sizeof acc); memset(sm, 0, sizeof sm); memset(clip, 0, sizeof clip); memset(cnt, 0, sizeof cnt);
 	}
 }
+
 static volatile uint64_t rx_start_ts; static volatile int rx_timed_req;
 static void *rx_thread(void *a)
 {

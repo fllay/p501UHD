@@ -9,7 +9,8 @@ sleep 3
 mount | grep -q "tmpfs on /tmp " || mount -t tmpfs -o size=256m tmpfs /tmp
 export P501_BIT=${P501_BIT:-/home/xilinx/p501UHD/base_ts_txbuf/system_top.bit}
 export P501_STREAM_DEBUG=1
-export P501_TRACKING=1   # AD9361 RX DC-offset + quadrature tracking (off by default in the driver)
+# RX DC/quadrature tracking stays off (P501_TRACKING=1 turns it on in the C daemon): the Python daemon never applied it
+# (it imports the older jupyter_notebooks driver), so every tested setup ran without it.
 # TX slot size in KiB: must be >= the host's TX message (uhd_p501 sends 128 KiB). The TX ring holds 8 x 4 MiB / slot messages, so a
 # short slot buys more TX buffering in time (1 slot = 0.53 ms of 2-channel samples at 128 KiB); a 512 KiB slot gave only 34 ms for short messages
 export P501_TXP_KIB=${P501_TXP_KIB:-128}

@@ -17,7 +17,8 @@ The P501 has no host interface that UHD knows. This repository adds one, in thre
 1. **A UHD device module on the host**, `host/uhd_p501`, built as `libuhd_p501.so` and found by UHD through
    `UHD_MODULE_PATH`. It implements device discovery, the property tree (frequency, gain, rate, antenna, sensors), RX and TX
    streamers with hardware time, and stream commands.
-2. **A daemon and a streamer on the board.** `tools/p501d.py` brings up the AD9361 and answers a small TCP control protocol.
+2. **A daemon and a streamer on the board.** `kernel/ffs/p501d_c` (C; `tools/p501d.py` is the older Python version) loads
+   the bitstream, brings up the AD9361, runs the RX AGC and answers a small TCP control protocol.
    `kernel/ffs/p501_stream_wd.c` moves IQ samples between the FPGA DMAs and a USB3 bulk gadget.
 3. **FPGA changes** (`hdl_ts`, `p501/base_ts*`): a hardware timebase with timed RX start and a timed TX burst FIFO, and a
    deeper DAC buffer.
@@ -25,7 +26,7 @@ The P501 has no host interface that UHD knows. This repository adds one, in thre
 ```
  Open5GS core        gNB host (x86)                                 P501 board (PYNQ Linux on the ARM cores)
  ───────────         ─────────────────────────                      ─────────────────────────────────────────────
-                     OCUDU gnb                                      p501d.py ── AD9361 setup, gains, LO, TCP :5555
+                     OCUDU gnb                                      p501d (C) ── AD9361 setup, gains, LO, AGC, TCP :5555
  AMF ──N2/N3──       └ UHD 4.6                                      p501_stream (C, RT threads, FunctionFS)
  10.53.1.2             └ libuhd_p501.so  ◄── control: TCP/ECM ──►     ┌──────────────┐   ┌──────────────────────────┐
                            │                 192.168.2.0/24         │ RX DMA ring  │◄──│ PL: AD9361 ADC, p501_time │
@@ -73,7 +74,8 @@ AD9361 bring-up, about 1 s), no asynchronous underflow or late-burst messages to
 |---|---|
 | `host/uhd_p501/` | the UHD module (`p501_device.cpp`, CMake) |
 | `kernel/ffs/` | board side: `p501_stream_wd.c` (streamer), `p501d_start.sh` / `p501d_stop.sh` (gadget + daemon), out-of-tree `usb_f_fs` sources, USB test programs |
-| `tools/` | `p501d.py` (board daemon), gNB and board launchers (`run_gnb_p501.sh`, `full_restart_gnb.sh`, `board_restart_p501d.sh`, `core_watchdog.sh`), `usbout_test.cpp` (USB throughput), RF analysis scripts |
+| `kernel/ffs/p501d_c/` | the board daemon in C (bitstream, DMA rings, AD9361 driver, control protocol, AGC) |
+| `tools/` | `p501d.py` (the older Python board daemon), gNB and board launchers (`run_gnb_p501.sh`, `full_restart_gnb.sh`, `board_restart_p501d.sh`, `core_watchdog.sh`), `usbout_test.cpp` (USB throughput), RF analysis scripts |
 | `hdl_ts/` | Vivado sources of the PL time block and the DAC buffer (`p501_time.v`, `build_*.tcl`, testbench); simulation leftovers are not tracked |
 | `p501/` | board support: PYNQ image definition, bitstreams (`base`, `base_dmac32`, `base_ts`, `base_ts_txbuf`), AD9361 bring-up notebooks and report |
 | `examples/ocudu_gnb/` | the worked example: gNB configs (1x1 and 2x2), Open5GS config, results and lessons |
@@ -167,6 +169,8 @@ on the downlink (the next restart was fine), probably a random AD9361 calibratio
 - [ ] Reach OAI UE (B210) attach: it gets to RRC connected and then SRB1 hits the maximum RLC retransmissions; the phones are fine.
 
 **Driver and board software**
+- [x] Board daemon in C (`kernel/ffs/p501d_c`): no Python or PYNQ at run time, same results with phones.
+- [ ] Retire the Python daemon and the PYNQ image: a slim Linux (Yocto, Buildroot or PetaLinux), possibly with PREEMPT_RT, and a test of RX DC/quadrature tracking and the 80 MHz synth reference (`P501_TRACKING=1`, `P501_SYNTH_MAX_FREF=80008000`).
 - [ ] Asynchronous messages: report underflow, late burst and overflow to UHD through the async message queue.
 - [ ] The tolerance in the PL hides DAC DMA starvation (up to about 0.6 ms with heavy host logging); find and remove the cause.
 - [ ] Time: the host reads the board time over the control channel at most every 100 ms and extrapolates with its own clock in between (a burst of control transfers can wedge the USB IN pipe); take the time from the RX stream headers instead.

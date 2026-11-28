@@ -83,6 +83,8 @@ AD9361 bring-up, about 1 s), no asynchronous underflow or late-burst messages to
 
 ## Quick start
 
+Using the minimal Linux (SD or QSPI, no PYNQ)? Follow the step-by-step guide in [minimal_linux/README.md](minimal_linux/README.md) instead of step 1 below.
+
 Prerequisites: a P501 running the PYNQ image from `p501/` with the repository deployed under `/home/xilinx/p501UHD`
 (`deploy_to_board.sh`), a host with UHD 4.6 development files, libusb-1.0 and CMake, a USB3 cable, and a 10 MHz reference on
 the board's REF IN for phones to sync (see [TODO](#todo)).

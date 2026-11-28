@@ -141,6 +141,12 @@ What moved the numbers:
 Open: the uplink is lower in 2x2 with two phones than with one, and one 23.04 MS/s bring-up came up with CQI 4 and MCS 0
 on the downlink (the next restart was fine), probably a random AD9361 calibration state.
 
+## Minimal Linux (SD or QSPI)
+
+`minimal_linux/` builds a RAM-only Linux that boots straight into the C board daemon, from an SD card or from the
+on-board QSPI flash (prebuilt images on the `minimal-linux-v1` release). With it the gNB showed no late-slot warnings in a
+5-minute two-phone soak. See `minimal_linux/README.md`.
+
 ## Documentation
 
 - [`examples/ocudu_gnb/README.md`](examples/ocudu_gnb/README.md): setup, what each P501 setting means, lessons learned, 2x2.

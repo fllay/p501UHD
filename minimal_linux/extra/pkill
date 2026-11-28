@@ -1,0 +1,5 @@
+#!/bin/sh
+sig=-TERM; args=""
+while [ "${1#-}" != "$1" ]; do case $1 in -x|-f) args="$args $1";; -*) sig=$1;; esac; shift; done
+pids=$(/usr/bin/pgrep $args "$1") || exit 1
+for p in $pids; do [ "$p" = "$$" ] || kill $sig $p 2>/dev/null; done

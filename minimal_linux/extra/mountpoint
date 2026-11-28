@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$1" = -q ] && shift
+grep -q " $1 " /proc/mounts

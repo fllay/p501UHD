@@ -1,0 +1,13 @@
+#!/bin/sh
+# pgrep [-x] [-f] pattern  (busybox here has no pgrep)
+x=0; f=0
+while [ "${1#-}" != "$1" ]; do case $1 in -x) x=1;; -f) f=1;; esac; shift; done
+pat=$1; rc=1
+for d in /proc/[0-9]*; do
+  p=${d#/proc/}; [ "$p" = "$$" ] && continue
+  if [ $f = 1 ]; then s=$(tr '\0' ' ' < $d/cmdline 2>/dev/null); else read -r s < $d/comm 2>/dev/null || continue; fi
+  [ -z "$s" ] && continue
+  if [ $x = 1 ]; then [ "$s" = "$pat" ] || continue; else case $s in *$pat*) ;; *) continue;; esac; fi
+  echo $p; rc=0
+done
+exit $rc

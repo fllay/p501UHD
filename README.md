@@ -6,9 +6,11 @@ normal UHD device (`type=p501`) and works with `uhd_find_devices`, `benchmark_ra
 
 Nothing in OCUDU is modified. The gNB sees a UHD radio; everything board-specific lives in this repository.
 
-> Status (2026-11-24): a cell on band n78 (3489.42 MHz, 20 MHz, 30 kHz SCS) runs with real phones, **1x1 and 2x2**, on stock
-> OCUDU. 1x1: about 47 Mbit/s down, 12-15 Mbit/s up. 2x2: 26-31 Mbit/s down, 18-19 Mbit/s up, less stable. See
-> [Results](#results) and [TODO](#todo).
+> Status (2026-11-28): a cell on band n78 (3489.42 MHz, 20 MHz, 30 kHz SCS) runs with real phones, **1x1 and 2x2**, on stock
+> OCUDU. Best setup: 2x2 at 23.04 MS/s, which gives about 90 Mbit/s down and 12-14 Mbit/s up to one phone and about
+> 49 + 49 down / 6 + 5 up to two phones. The board can now run a **RAM-only minimal Linux** from an SD card or the QSPI
+> flash (no PYNQ); with it a 5-minute two-phone soak showed no late-slot warnings. See [Results](#results),
+> [Minimal Linux](#minimal-linux-sd-or-qspi) and [TODO](#todo).
 
 ## What the project is
 
@@ -24,7 +26,7 @@ The P501 has no host interface that UHD knows. This repository adds one, in thre
    deeper DAC buffer.
 
 ```
- Open5GS core        gNB host (x86)                                 P501 board (PYNQ Linux on the ARM cores)
+ Open5GS core        gNB host (x86)                                 P501 board (PYNQ or minimal Linux on the ARM cores)
  ───────────         ─────────────────────────                      ─────────────────────────────────────────────
                      OCUDU gnb                                      p501d (C) ── AD9361 setup, gains, LO, AGC, TCP :5555
  AMF ──N2/N3──       └ UHD 4.6                                      p501_stream (C, RT threads, FunctionFS)
@@ -78,6 +80,7 @@ AD9361 bring-up, about 1 s), no asynchronous underflow or late-burst messages to
 | `tools/` | `p501d.py` (the older Python board daemon), gNB and board launchers (`run_gnb_p501.sh`, `full_restart_gnb.sh`, `board_restart_p501d.sh`, `core_watchdog.sh`), `usbout_test.cpp` (USB throughput), RF analysis scripts |
 | `hdl_ts/` | Vivado sources of the PL time block and the DAC buffer (`p501_time.v`, `build_*.tcl`, testbench); simulation leftovers are not tracked |
 | `p501/` | board support: PYNQ image definition, bitstreams (`base`, `base_dmac32`, `base_ts`, `base_ts_txbuf`), AD9361 bring-up notebooks and report |
+| `minimal_linux/` | the RAM-only minimal Linux for the board (SD and QSPI images, build and flash scripts, step-by-step guide); prebuilt images on the `minimal-linux-v1` release |
 | `examples/ocudu_gnb/` | the worked example: gNB configs (1x1 and 2x2), Open5GS config, results and lessons |
 | `configs/`, `docs/BRINGUP_NOTES.md` | working configuration notes |
 
@@ -124,6 +127,10 @@ either way is noise). Sum of both phones where two are attached.
 | 2x2, 23.04 MS/s, same | 2 | 50.1 + 51.0 Mbit/s (rank 2, MCS 27) | 3.5 + 3.6 Mbit/s | UL MCS 8-10: RX gain too low for this range |
 | 2x2, 23.04 MS/s, RX 50 (manual sweep) | 2 | - | 7.2 + 8.0 Mbit/s | sweep 30-60: 50 best, 55 clips, 30 too weak |
 | 2x2, 23.04 MS/s, board AGC on | 1 | - | 11.4-12.2 Mbit/s | AGC went 35 -> 43 and 62 -> 44-46 |
+| 2x2, 23.04 MS/s, AGC on, C daemon (PYNQ image), each phone alone | 1 | 90.1 (MCS 27) / 62.9 (MCS 21) | 12.5 / 13.1 | phones at different positions; 8-11 late-uplink warnings per 40 s |
+| 2x2, 23.04 MS/s, AGC on, C daemon (PYNQ image) | 2 | 51.6 + 50.1 | 5.7 + 6.0 | |
+| 2x2, 23.04 MS/s, AGC on, minimal Linux (SD) | 1 / 1 / 2 | 73.5 / 88.4 / 43.9 + 44.5 | 7.3 / 13.8 / 3.8 + 8.6 | one 15 s run per figure |
+| **2x2, 23.04 MS/s, AGC on, minimal Linux (QSPI)**, 5-minute soak | 2 | 48.7 + 48.9 | 6.8 + 5.5 | **0 late-slot warnings** in 5 minutes |
 
 What moved the numbers:
 - **RX gain.** The best `rx_gain` depends on the distance to the phones (25 next to the antennas, 45-50 a few metres
@@ -140,6 +147,12 @@ What moved the numbers:
 - **Board temperature** is a suspect for worse results in a warm room (a hot board and reference clock gave lower DL MCS
   and more HARQ failures); not measured yet, the board exposes no temperature sensor to Linux.
 
+- **Board OS.** The late-uplink warnings (8-11 per 40 s on the PYNQ image) disappeared on the minimal Linux (0 in a
+  5-minute two-phone soak), which points at stalls in the PYNQ Linux on the board, not at the USB link or the driver. The
+  throughput did not change much (it also depends on phone position, gain and temperature).
+- **AD9361 tracking and the 80 MHz synth reference** (`P501_TRACKING=1`, `P501_SYNTH_MAX_FREF=80008000`): no measurable
+  difference (one phone, 23.04 MS/s: DL 88.1 / UL 13.8 Mbit/s without, 84.8 / 13.9 with). They are on in the minimal Linux.
+
 Open: the uplink is lower in 2x2 with two phones than with one, and one 23.04 MS/s bring-up came up with CQI 4 and MCS 0
 on the downlink (the next restart was fine), probably a random AD9361 calibration state.
 
@@ -151,6 +164,7 @@ on-board QSPI flash (prebuilt images on the `minimal-linux-v1` release). With it
 
 ## Documentation
 
+- [`minimal_linux/README.md`](minimal_linux/README.md): the minimal Linux (SD and QSPI), a step-by-step guide from power-on to a running gNB, flashing, rebuilding.
 - [`examples/ocudu_gnb/README.md`](examples/ocudu_gnb/README.md): setup, what each P501 setting means, lessons learned, 2x2.
 - [`docs/BRINGUP_NOTES.md`](docs/BRINGUP_NOTES.md): the working configuration and the open problems.
 - [`p501/README.md`](p501/README.md) and [`p501/docs/AD9361_BRINGUP_REPORT.md`](p501/docs/AD9361_BRINGUP_REPORT.md): board support and the AD9361 bring-up.
@@ -178,11 +192,13 @@ on-board QSPI flash (prebuilt images on the `minimal-linux-v1` release). With it
 
 **Driver and board software**
 - [x] Board daemon in C (`kernel/ffs/p501d_c`): no Python or PYNQ at run time, same results with phones.
-- [ ] Retire the Python daemon and the PYNQ image: a slim Linux (Yocto, Buildroot or PetaLinux), possibly with PREEMPT_RT, and a test of RX DC/quadrature tracking and the 80 MHz synth reference (`P501_TRACKING=1`, `P501_SYNTH_MAX_FREF=80008000`).
+- [x] Slim Linux without PYNQ: `minimal_linux/` (initramfs from SD or QSPI, about 17.5 MB, boot to ready in about 1 minute). The tracking and 80 MHz synth reference test is done (no difference).
+- [ ] Minimal Linux: try PREEMPT_RT, drop what is unused (kernel modules, drivers) to shrink the image, keep the dropbear host key and the USB MAC across boots, and a build that does not depend on the author's working directory.
+- [ ] Retire the Python daemon (`tools/p501d.py`) and the PYNQ-only scripts once the minimal Linux has had more soak time (hours, several phones).
 - [ ] Asynchronous messages: report underflow, late burst and overflow to UHD through the async message queue.
 - [ ] The tolerance in the PL hides DAC DMA starvation (up to about 0.6 ms with heavy host logging); find and remove the cause.
 - [ ] Time: the host reads the board time over the control channel at most every 100 ms and extrapolates with its own clock in between (a burst of control transfers can wedge the USB IN pipe); take the time from the RX stream headers instead.
-- [ ] Persist the host settings that now have to be made by hand (the CPU governor; `usbfs_memory_mb` is persistent already) and make the launcher scripts independent of the author's paths.
+- [ ] Persist the host settings that now have to be made by hand after every host reboot (CPU governor, `usbfs_memory_mb`, the `enx021a2b3c4d12` address and the 10.45.0.0/24 route) and make the launcher scripts independent of the author's paths.
 - [ ] TX ring sized in time instead of messages, chosen automatically from the host message length (`P501_TXP_KIB` is a manual setting).
 - [ ] Reduce USB data with 12-bit packing in the PL (25% less TX and RX data), or move to 10G Ethernet (needs a MAC and DMA in the PL; only worth it if USB latency becomes the limit).
 - [ ] Test other UHD versions (4.7 and later) and other OCUDU or srsRAN builds; add `benchmark_rate` and loopback tests to a CI job.
